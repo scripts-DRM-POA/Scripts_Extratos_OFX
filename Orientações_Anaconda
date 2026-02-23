@@ -1,0 +1,13 @@
+Para rodar os arquivos, são necessárias as bibliotecas/engines do arquivo "Bibliotecas_Engines_Adicionais" que devem ser instaladas através do Anaconda Prompt, utilizando os comandos abaixo:
+
+Sugestão: Criar uma pasta chamada "Bibliotecas_Engines_Anaconda", dentro da pasta "Downloads" e salvar os arquivos nessa pasta.
+
+Abrir o Anaconda Prompt;
+
+Após, executar o comando "cd C:\Users\michael.lasch\Downloads\Bibliotecas_Engines_Anaconda", substituindo michael.lasch pelo seu usuário de rede;
+
+O passo seguinte é executar o comando de instalação das engines:
+
+"pip install xlsxwriter-3.2.9-py3-none-any.whl pypdfium2-5.3.0-py3-none-win_amd64.whl pdfminer_six-20251230-py3-none-any.whl charset_normalizer-3.4.4-py3-none-any.whl pillow-12.1.0-pp311-pypy311_pp73-win_amd64.whl pdfplumber-0.11.9-py3-none-any.whl xlrd-2.0.2-py2.py3-none-any.whl"
+
+Depois de concluída a instalação, poderá rodar os scripts para tratar dados em pdf e conversão para xlsx.
