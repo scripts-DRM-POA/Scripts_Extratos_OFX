@@ -1,4 +1,4 @@
-Para rodar os arquivos, são necessárias as bibliotecas/engines do arquivo "Bibliotecas_Engines_Adicionais" que devem ser instaladas através do Anaconda Prompt, utilizando os comandos abaixo:
+Para rodar os arquivos, são necessárias as bibliotecas salvas no arquivo "Bibliotecas_Engines_Adicionais" que devem ser instaladas através do Anaconda Prompt, utilizando os comandos abaixo:
 
 Sugestão: Criar uma pasta chamada "Bibliotecas_Engines_Anaconda", dentro da pasta "Downloads" e salvar os arquivos nessa pasta.
 
