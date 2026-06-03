@@ -1,0 +1,2903 @@
+# -*- coding: utf-8 -*-
+"""
+Extrator multi-layout de extratos bancários (PDF + OFX, sem OCR / sem Tesseract) - v51.3
+
+Uso:
+    python extratos_PDFmultilayout_ofx_e_comSenhas_v51_3.py
+ou
+    python extratos_PDFmultilayout_ofx_e_comSenhas_v51_3.py --pasta "C:\\caminho\\dos\\pdfs"
+
+Gera um XLSX com duas abas:
+    - Consolidado
+    - Logs
+
+Colunas do Consolidado:
+    Arquivo | Data | Descrição | Documento | Valor | Tipo | Débito | Crédito
+
+Colunas do Logs:
+    Arquivo | n_transações_obtidas
+"""
+
+import sys
+import os
+import re
+import glob
+import argparse
+import getpass
+import calendar
+from datetime import datetime
+
+try:
+    import fitz  # PyMuPDF
+except Exception:
+    print("\nERRO: biblioteca 'pymupdf' não está instalada.")
+    print("Instale com:\n    pip install pymupdf\n")
+    input("Pressione ENTER para sair...")
+    sys.exit()
+
+try:
+    import pandas as pd
+except Exception:
+    print("\nERRO: biblioteca 'pandas' não está instalada.")
+    print("Instale com:\n    pip install pandas\n")
+    input("Pressione ENTER para sair...")
+    sys.exit()
+
+
+PDF_PASSWORD_CACHE = []
+PDF_PASSWORD_BY_FILE = {}
+
+
+def _prompt_pdf_password(pdf_path: str):
+    prompt_title = "Senha do PDF"
+    prompt_text = f"Informe a senha para abrir o PDF:\n{os.path.basename(pdf_path)}"
+    try:
+        import tkinter as tk
+        from tkinter import simpledialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        senha = simpledialog.askstring(prompt_title, prompt_text, show="*", parent=root)
+        root.destroy()
+        return senha
+    except Exception:
+        try:
+            return getpass.getpass(f"Senha do PDF '{os.path.basename(pdf_path)}' (ENTER cancela): ")
+        except Exception:
+            return None
+
+
+def open_pdf_with_password(pdf_path: str):
+    doc = fitz.open(pdf_path)
+    if not doc.needs_pass:
+        PDF_PASSWORD_BY_FILE[os.path.abspath(pdf_path)] = None
+        return doc, None
+
+    candidates = []
+    file_key = os.path.abspath(pdf_path)
+    if file_key in PDF_PASSWORD_BY_FILE and PDF_PASSWORD_BY_FILE[file_key] is not None:
+        candidates.append(PDF_PASSWORD_BY_FILE[file_key])
+    for pw in PDF_PASSWORD_CACHE:
+        if pw not in candidates:
+            candidates.append(pw)
+
+    for pw in candidates:
+        try:
+            if doc.authenticate(pw):
+                PDF_PASSWORD_BY_FILE[file_key] = pw
+                if pw and pw not in PDF_PASSWORD_CACHE:
+                    PDF_PASSWORD_CACHE.append(pw)
+                return doc, pw
+        except Exception:
+            pass
+
+    while True:
+        senha = _prompt_pdf_password(pdf_path)
+        if senha is None or senha == "":
+            doc.close()
+            raise RuntimeError("PDF protegido por senha; operação cancelada pelo usuário")
+        try:
+            if doc.authenticate(senha):
+                PDF_PASSWORD_BY_FILE[file_key] = senha
+                if senha not in PDF_PASSWORD_CACHE:
+                    PDF_PASSWORD_CACHE.append(senha)
+                return doc, senha
+        except Exception:
+            pass
+
+
+MESES_PT = {
+    "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4, "maio": 5, "junho": 6,
+    "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12
+}
+MESES_BAN = {
+    "JANEIRO": 1, "FEVEREIRO": 2, "MARCO": 3, "MARÇO": 3, "ABRIL": 4, "MAIO": 5, "JUNHO": 6,
+    "JULHO": 7, "AGOSTO": 8, "SETEMBRO": 9, "OUTUBRO": 10, "NOVEMBRO": 11, "DEZEMBRO": 12
+}
+
+
+def norm_space(s: str) -> str:
+    return re.sub(r"\s{2,}", " ", s.replace("\xa0", " ").replace("\uf166", " ").replace("\ue90a", " ").replace("\uf18f", " ").strip())
+
+
+def money_to_float(tok: str) -> float:
+    t = tok.replace("R$", "").strip().replace("−", "-")
+    neg = False
+    if t.endswith("-"):
+        neg = True
+        t = t[:-1]
+    if t.startswith("-"):
+        neg = True
+        t = t[1:]
+    val = float(t.replace(".", "").replace(",", "."))
+    return -val if neg else val
+
+
+DOC_LABELS = {"documento", "doc", "nº documento", "no documento", "nr documento", "nro. documento", "nro documento"}
+LOT_LABELS = {"lote", "ag. origem", "ag origem", "origem", "banco"}
+
+
+def only_digits(s: str) -> str:
+    return re.sub(r"\D", "", s or "")
+
+
+def is_probable_document_token(tok: str) -> bool:
+    t = norm_space(tok)
+    d = only_digits(t)
+    if not d or len(d) <= 6:
+        return False
+    if len(set(d)) == 1:
+        return False
+    return bool(re.fullmatch(r"[\d./-]+", t))
+
+
+def clean_document_token(tok: str) -> str:
+    t = norm_space(tok)
+    return t if is_probable_document_token(t) else ""
+
+
+def clean_document_token_flexible(tok: str) -> str:
+    t = norm_space(tok)
+    if not t:
+        return ""
+    if re.fullmatch(r"[\d./-]{4,}", t):
+        d = only_digits(t)
+        if d and len(set(d)) > 1:
+            return t
+    return ""
+
+
+def clean_document_token_sicredi(tok: str) -> str:
+    t = norm_space(tok)
+    if not t:
+        return ""
+    up = t.upper()
+    if up in {"TARIFA", "FGTS", "DAS", "DEPOSI", "CAPTACAO", "PIX_DEB", "SEG_ICATU"}:
+        return t
+    if re.fullmatch(r"[A-Z0-9_./-]{3,25}", up):
+        if re.fullmatch(r"\d{1,3}(?:\.\d{3})*,\d{2}", t):
+            return ""
+        if re.fullmatch(r"\d{2}/\d{2}/\d{4}", t):
+            return ""
+        return t
+    return ""
+
+
+def extract_document_from_block_sicredi(block):
+    normalized = [norm_space(b) for b in block if norm_space(b)]
+    for idx, b in enumerate(normalized):
+        if b.lower() in {"documento", "doc"}:
+            for cand in normalized[idx + 1: idx + 4]:
+                cleaned = clean_document_token_sicredi(cand)
+                if cleaned:
+                    return cleaned
+    candidates = []
+    for idx, b in enumerate(normalized):
+        cleaned = clean_document_token_sicredi(b)
+        if cleaned:
+            candidates.append((idx, cleaned))
+    if not candidates:
+        return ""
+    return candidates[-1][1]
+
+
+def is_balance_or_summary_line(s: str) -> bool:
+    low = norm_space(s).lower()
+    if not low:
+        return True
+    return any(x in low for x in [
+        "saldo anterior", "saldo do dia", "saldo final", "saldo total", "saldo disponível", "saldo disponivel",
+        "saldo bloqueado", "saldo em c/c", "saldo da conta", "saldo na data", "saldo após", "saldo apos",
+        "saldo de conta corrente", "saldo por transação", "saldo por transacao", "saldo dev", "saldo cred", "resumo", "a transportar",
+        "totalizador", "totais"
+    ])
+
+
+def normalize_text_for_dedupe(s: str) -> str:
+    s = norm_space(str(s)).lower()
+    s = re.sub(r"[^\w]+", " ", s, flags=re.UNICODE)
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def extract_document_from_block(block, doc_labels=None):
+    doc_labels = {x.lower() for x in (doc_labels or DOC_LABELS)}
+    normalized = [norm_space(b) for b in block if norm_space(b)]
+
+    for idx, b in enumerate(normalized):
+        if b.lower() in doc_labels:
+            for cand in normalized[idx + 1: idx + 5]:
+                cleaned = clean_document_token(cand)
+                if cleaned:
+                    return cleaned
+
+    for b in normalized:
+        m = re.search(r"(?:documento|doc)\s*[:.-]?\s*([\d./-]{4,})", b, re.I)
+        if m:
+            cleaned = clean_document_token(m.group(1))
+            if cleaned:
+                return cleaned
+
+    candidates = []
+    for idx, b in enumerate(normalized):
+        low = b.lower()
+        if low in LOT_LABELS or low in doc_labels:
+            continue
+        cleaned = clean_document_token(b)
+        if cleaned:
+            candidates.append((len(only_digits(cleaned)), idx, cleaned))
+
+    if not candidates:
+        return ""
+    candidates.sort(key=lambda x: (-x[0], x[1]))
+    return candidates[0][2]
+
+
+def standardize(df: pd.DataFrame, doc_cleaner=clean_document_token) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Data", "Descrição", "Documento", "Valor", "Tipo", "Débito", "Crédito"])
+
+    out = df.copy()
+    out["Data"] = out["Data"].astype(str).str.strip()
+    out["Descrição"] = out["Descrição"].astype(str).map(norm_space).str.strip(" -")
+    if "Documento" not in out.columns:
+        out["Documento"] = ""
+    out["Documento"] = out["Documento"].fillna("").astype(str).map(doc_cleaner)
+    out["Valor"] = pd.to_numeric(out["Valor"], errors="coerce")
+
+    out = out[out["Valor"].notna()]
+    out = out[out["Data"].str.match(r"^\d{2}/\d{2}/\d{4}$", na=False)]
+    out = out[out["Valor"] != 0]
+    out = out[~out["Descrição"].map(is_balance_or_summary_line)]
+
+    bad = re.compile(
+        r"saldo anterior|saldo do dia|saldo final|saldo total|saldo disponível|saldo disponivel|saldo bloqueado|"
+        r"solicitado em:|fale com a gente|ouvidoria|sac:|cpf/cnpj:|instituição:|instituicao:|agência:|agencia:|"
+        r"conta:|período:|periodo:|filtros aplicados|relatório gerado em|relatorio gerado em|extrato financeiro|"
+        r"tipo de saldo|tipo de transação|tipo de transacao|a transportar|versão |versao |extrato consolidado inteligente|"
+        r"internet banking empresarial|consultas, informações|consultas, informacoes|redes sociais|resumo - |"
+        r"saldo de conta corrente em|movimentação|movimentacao|lançamentos|lancamentos$|saldo dev|saldo cred",
+        re.IGNORECASE
+    )
+    out = out[~out["Descrição"].str.contains(bad, na=False)]
+
+    out["Tipo"] = out["Valor"].apply(lambda x: "C" if x > 0 else "D")
+    out["Débito"] = out["Valor"].apply(lambda x: x if x < 0 else "")
+    out["Crédito"] = out["Valor"].apply(lambda x: x if x > 0 else "")
+
+    return out[["Data", "Descrição", "Documento", "Valor", "Tipo", "Débito", "Crédito"]]
+
+def extract_lines(pdf_path: str):
+    doc, password = open_pdf_with_password(pdf_path)
+    try:
+        lines = []
+        for page in doc:
+            txt = page.get_text("text") or ""
+            for ln in txt.splitlines():
+                ln = norm_space(ln)
+                if ln:
+                    lines.append(ln)
+        return lines, password
+    finally:
+        doc.close()
+
+
+def list_input_files(folder: str):
+    seen = {}
+    patterns = ["*.pdf", "*.PDF", "*.ofx", "*.OFX"]
+    for pattern in patterns:
+        for p in glob.glob(os.path.join(folder, pattern)):
+            key = os.path.abspath(p).lower()
+            if key not in seen:
+                seen[key] = os.path.abspath(p)
+    return sorted(seen.values())
+
+
+def normalize_ofx_date(dt: str) -> str:
+    if not dt:
+        return ""
+    m = re.search(r"(\d{8})", dt)
+    if not m:
+        return ""
+    s = m.group(1)
+    try:
+        return datetime.strptime(s, "%Y%m%d").strftime("%d/%m/%Y")
+    except Exception:
+        return ""
+
+
+def is_ofx_balance_transaction(descricao: str) -> bool:
+    """Identifica lançamentos OFX meramente informativos de saldo.
+
+    Alguns bancos exportam saldos dentro de blocos <STMTTRN>, como se fossem
+    transações: SALDO TOTAL DISPONÍVEL DIA, SALDO MOVIMENTAÇÃO CONTA,
+    SALDO APLIC. AUT., SALDO ANTERIOR, SALDO FINAL etc. Esses registros não
+    representam movimentação bancária e devem ser ignorados apenas no parser OFX.
+    """
+    desc = norm_space(str(descricao or "")).upper()
+    if not desc:
+        return False
+
+    # Regra conservadora: remove somente memos/names que contenham a palavra SALDO.
+    # Mantém aplicações/resgates/rendimentos reais, como APL APLIC AUT MAIS,
+    # RES APLIC AUT MAIS e REND PAGO APLIC AUT MAIS.
+    return bool(re.search(r"\bSALDO\b", desc))
+
+
+def parse_ofx_file(ofx_path):
+    try:
+        texto = open(ofx_path, "r", encoding="latin1", errors="ignore").read()
+    except Exception:
+        texto = open(ofx_path, "r", encoding="utf-8", errors="ignore").read()
+
+    blocos = re.findall(r"<STMTTRN>(.*?)</STMTTRN>", texto, flags=re.S | re.I)
+    rows = []
+
+    def campo(raw: str, tag: str) -> str:
+        m = re.search(rf"<{tag}>(.*?)(?:$|<)", raw, flags=re.I | re.S)
+        return norm_space(m.group(1)) if m else ""
+
+    debit_types = {
+        "DEBIT", "PAYMENT", "DIRECTDEBIT", "REPEATPMT", "ATM",
+        "POS", "CHECK", "FEE", "SRVCHG"
+    }
+    credit_types = {
+        "CREDIT", "DEP", "DIRECTDEP", "DIV", "INT"
+    }
+
+    for raw in blocos:
+        data = normalize_ofx_date(campo(raw, "DTPOSTED"))
+        valor_txt = campo(raw, "TRNAMT")
+        trntype = campo(raw, "TRNTYPE").upper()
+
+        if not data or not valor_txt:
+            continue
+
+        try:
+            valor = float(str(valor_txt).replace(",", "."))
+        except Exception:
+            continue
+
+        # Alguns OFX vêm com TRNAMT sem sinal, mas com TRNTYPE correto.
+        # Nesses casos, o tipo da transação deve prevalecer.
+        if trntype in debit_types:
+            valor = -abs(valor)
+        elif trntype in credit_types:
+            valor = abs(valor)
+
+        descricao = campo(raw, "MEMO") or campo(raw, "NAME") or campo(raw, "TRNTYPE") or "Lançamento OFX"
+        if is_ofx_balance_transaction(descricao):
+            continue
+
+        documento = campo(raw, "CHECKNUM") or campo(raw, "REFNUM") or campo(raw, "FITID")
+
+        rows.append([data, descricao, documento, valor])
+
+    return standardize(
+        pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]),
+        doc_cleaner=lambda x: norm_space(str(x))[:80]
+    )
+
+# ---------------- C6 Bank ----------------
+
+
+def parse_c6(lines, source_name=""):
+    month_heading = re.compile(
+        r"^(Janeiro|Fevereiro|Março|Marco|Abril|Maio|Junho|Julho|Agosto|Setembro|Outubro|Novembro|Dezembro)\s+(\d{4})\b(?:\s*\(\s*(\d{2}/\d{2}/\d{4})\s*-\s*(\d{2}/\d{2}/\d{4})\s*\))?",
+        re.I
+    )
+    date_mmdd = re.compile(r"^\d{2}/\d{2}$")
+    money_re = re.compile(r"^-?R\$\s*\d{1,3}(?:\.\d{3})*,\d{2}$")
+
+    month_to_num = {
+        "janeiro": 1, "fevereiro": 2, "março": 3, "marco": 3, "abril": 4, "maio": 5, "junho": 6,
+        "julho": 7, "agosto": 8, "setembro": 9, "outubro": 10, "novembro": 11, "dezembro": 12
+    }
+
+    def last_day_of_month(year, month):
+        return calendar.monthrange(year, month)[1]
+
+    def parse_block_headers(all_lines):
+        headers = []
+        for idx, line in enumerate(all_lines):
+            m = month_heading.match(line)
+            if not m:
+                continue
+            mon_name = m.group(1)
+            year = int(m.group(2))
+            month = month_to_num[mon_name.lower()]
+            start_s = m.group(3)
+            end_s = m.group(4)
+            start_dt = datetime.strptime(start_s, "%d/%m/%Y") if start_s else None
+            end_dt = datetime.strptime(end_s, "%d/%m/%Y") if end_s else None
+            full_month = True
+            if start_dt and end_dt:
+                full_month = (start_dt.day == 1 and end_dt.day == last_day_of_month(year, month))
+            headers.append({
+                "idx": idx,
+                "year": year,
+                "month": month,
+                "start_dt": start_dt,
+                "end_dt": end_dt,
+                "full_month": full_month,
+            })
+        return headers
+
+    def compute_allowed_years(headers):
+        if not headers:
+            return None
+
+        year_months = {}
+        for h in headers:
+            year_months.setdefault(h["year"], set()).add(h["month"])
+        years_in_order = []
+        for h in headers:
+            if not years_in_order or years_in_order[-1] != h["year"]:
+                years_in_order.append(h["year"])
+
+        allowed_years = set(year_months.keys())
+        if len(years_in_order) == 1:
+            return allowed_years
+
+        last_year = years_in_order[-1]
+        prev_year = years_in_order[-2]
+        last_headers = [h for h in headers if h["year"] == last_year]
+        prev_headers = [h for h in headers if h["year"] == prev_year]
+        last_month_count = len(year_months.get(last_year, set()))
+        prev_month_count = len(year_months.get(prev_year, set()))
+        last_all_partial = bool(last_headers) and all(not h["full_month"] for h in last_headers)
+
+        # Regra 1: sobra clara do ano seguinte no final do PDF anual.
+        if last_year > prev_year and prev_month_count >= 10 and last_month_count <= 2:
+            allowed_years.discard(last_year)
+            return allowed_years
+
+        # Regra 2: bloco final nitidamente parcial, mesmo sem depender do nome do arquivo.
+        if last_year > prev_year and prev_month_count >= 10 and last_all_partial:
+            allowed_years.discard(last_year)
+            return allowed_years
+
+        return allowed_years
+
+    headers = parse_block_headers(lines)
+    allowed_years = compute_allowed_years(headers)
+
+    rows = []
+    current_year = None
+    i = 0
+    N = len(lines)
+
+    while i < N:
+        ln = lines[i]
+        m = month_heading.match(ln)
+        if m:
+            current_year = int(m.group(2))
+            i += 1
+            continue
+
+        low = ln.lower()
+        if (
+            low.startswith("sem lançamentos no mês") or low.startswith("sem lancamentos no mes") or
+            low.startswith("saldo do dia ") or low.startswith("saldo do dia •") or
+            low.startswith("entradas:") or low.startswith("saídas:") or low.startswith("saidas:")
+        ):
+            i += 1
+            continue
+
+        if low in {"data", "lançamento", "lancamento", "contábil", "contabil", "tipo", "descrição", "descricao", "valor"} or ln == "•":
+            i += 1
+            continue
+
+        if current_year and allowed_years is not None and current_year not in allowed_years:
+            i += 1
+            continue
+
+        if current_year and date_mmdd.match(ln) and i + 3 < N and date_mmdd.match(lines[i + 1]):
+            data_lanc = ln
+            tipo = lines[i + 2]
+            desc = lines[i + 3]
+            j = i + 4
+
+            while j < N and not money_re.match(lines[j]):
+                nxt = lines[j]
+                if (
+                    date_mmdd.match(nxt) or nxt.startswith("Saldo do dia ") or
+                    nxt.startswith("Saldo do dia •") or month_heading.match(nxt)
+                ):
+                    break
+                low_nxt = nxt.lower()
+                if low_nxt in {"data", "lançamento", "lancamento", "contábil", "contabil", "tipo", "descrição", "descricao", "valor"} or nxt == "•":
+                    j += 1
+                    continue
+                desc = norm_space(desc + " " + nxt)
+                j += 1
+
+            if j < N and money_re.match(lines[j]):
+                try:
+                    data = datetime.strptime(f"{data_lanc}/{current_year}", "%d/%m/%Y").strftime("%d/%m/%Y")
+                    valor = money_to_float(lines[j])
+                    descricao = norm_space(f"{tipo} {desc}")
+                    rows.append([data, descricao, "", valor])
+                    i = j + 1
+                    continue
+                except Exception:
+                    pass
+
+        i += 1
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]))
+
+
+# ---------------- Caixa ----------------
+
+def parse_caixa_layout1(lines):
+    date_re = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+    doc_re = re.compile(r"^\d{4,}$")
+    val_re = re.compile(r"^\d{1,3}(?:\.\d{3})*,\d{2}\s+[CD]$")
+    saldo_re = re.compile(r"^\d{1,3}(?:\.\d{3})*,\d{2}\s+[CD]$")
+    rows = []
+    i = 0
+    N = len(lines)
+    while i < N:
+        ln = lines[i]
+        low = ln.lower()
+        if not date_re.match(ln):
+            i += 1
+            continue
+        # data + doc + histórico + valor [saldo opcional]
+        if i + 3 >= N or not doc_re.match(lines[i+1]):
+            i += 1
+            continue
+        data = ln
+        doc = lines[i+1]
+        j = i + 2
+        hist_parts = []
+        while j < N and not val_re.match(lines[j]):
+            cur = lines[j]
+            cur_low = cur.lower()
+            if date_re.match(cur) or cur_low.startswith('saldo anterior') or cur_low.startswith('limite '):
+                break
+            if cur_low in {'data mov.','nr. doc.','histórico','historico','valor','saldo'}:
+                j += 1
+                continue
+            if cur_low.startswith('firefox ') or 'about:blank' in cur_low:
+                j += 1
+                continue
+            hist_parts.append(cur)
+            j += 1
+        if not hist_parts or j >= N or not val_re.match(lines[j]):
+            i += 1
+            continue
+        hist = norm_space(' '.join(hist_parts))
+        valtok = lines[j]
+        m = re.match(r'^(\d{1,3}(?:\.\d{3})*,\d{2})\s+([CD])$', valtok)
+        valor = money_to_float(m.group(1))
+        valor = abs(valor) if m.group(2) == 'C' else -abs(valor)
+        rows.append([data, hist, doc, valor])
+        j += 1
+        if j < N and saldo_re.match(lines[j]):
+            j += 1
+        i = j
+    return standardize(pd.DataFrame(rows, columns=['Data','Descrição','Documento','Valor']), doc_cleaner=clean_document_token_flexible)
+
+
+def parse_caixa_layout2(pdf_path, pdf_password=None):
+    if pdfplumber is None:
+        return pd.DataFrame(columns=["Data", "Descrição", "Documento", "Valor", "Tipo", "Débito", "Crédito"])
+
+    texto = ""
+    with pdfplumber.open(pdf_path, password=pdf_password) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                texto += t + "\n"
+
+    linhas = [re.sub(r"\s{2,}", " ", l.strip()) for l in texto.splitlines() if l.strip()]
+
+    re_tx = re.compile(
+        r'^(?P<data>\d{2}/\d{2}/\d{4})\s+\d{2}/\d{2}\s+\d{2}:\d{2}\s+'
+        r'(?P<doc>\d{6,})\s+(?P<hist>.*?)\s+'
+        r'(?P<val>\d{1,3}(?:\.\d{3})*,\d{2})(?P<dc>[CD])\s+'
+        r'(?P<saldo>\d{1,3}(?:\.\d{3})*,\d{2})(?P<sdc>[CD])$'
+    )
+    re_periodo = re.compile(r'^\d{2}/\d{2}/\d{4}\s+-\s+\d{2}/\d{2}/\d{4}\b')
+
+    skip_exact = {
+        'extrato histórico da conta', 'extrato historico da conta',
+        'titular', 'periodo', 'conta', 'nome do produto', 'data e hora',
+        'data mov. data e hora nr.doc. histórico valor saldo',
+        'data mov. data e hora nr.doc. historico valor saldo',
+        'data mov. nr.doc. histórico valor saldo',
+        'data mov. nr.doc. historico valor saldo'
+    }
+    skip_contains = [
+        'consulta realizada em', 'página ', 'pagina ',
+        'conta corrente pessoa juridica caixa', 'cpf/cnpj do titular',
+        'nome da unidade', 'unidade', 'saldo anterior'
+    ]
+    rotativo_markers = [
+        'informações do limite rotativo', 'informacoes do limite rotativo',
+        'juros prov', 'mora prov', 'multa prov', 'iof aliq básica', 'iof aliq basica',
+        'iof aliq adicional', 'custo efetivo total a.m', 'custo efetivo total a.a',
+        'sublimite aval', 'limite disponibilizado', 'limite utilizado',
+        'limite disponível', 'limite disponivel'
+    ]
+
+    rows = []
+    last_idx = None
+    in_rotativo = False
+
+    for line in linhas:
+        low = line.lower()
+
+        m = re_tx.match(line)
+        if m:
+            in_rotativo = False
+            data = m.group('data')
+            doc = m.group('doc')
+            hist = norm_space(m.group('hist'))
+            val = money_to_float(m.group('val'))
+            val = abs(val) if m.group('dc') == 'C' else -abs(val)
+            if hist and val != 0:
+                rows.append([data, hist, doc, val])
+                last_idx = len(rows) - 1
+            else:
+                last_idx = None
+            continue
+
+        if 'informações do limite rotativo' in low or 'informacoes do limite rotativo' in low:
+            in_rotativo = True
+            last_idx = None
+            continue
+
+        if in_rotativo:
+            if re_periodo.match(line):
+                # novo bloco/período depois da seção de limite rotativo
+                in_rotativo = False
+            else:
+                # ignora apenas a seção de limite; segue lendo o documento depois
+                continue
+
+        if low in skip_exact:
+            last_idx = None
+            continue
+        if any(x in low for x in skip_contains):
+            continue
+        if any(marker in low for marker in rotativo_markers):
+            last_idx = None
+            continue
+        if re_periodo.match(line):
+            last_idx = None
+            continue
+
+        if last_idx is not None:
+            if re.match(r'^\d{2}/\d{2}/\d{4}', line):
+                last_idx = None
+                continue
+            if re.fullmatch(r'\d{1,3}(?:\.\d{3})*/\d{2}-\d', line):
+                continue
+            rows[last_idx][1] = norm_space(rows[last_idx][1] + ' ' + line)
+
+    df = pd.DataFrame(rows, columns=['Data','Descrição','Documento','Valor'])
+    return standardize(df, doc_cleaner=clean_document_token_flexible)
+
+# ---------------- Banco do Brasil ----------------
+
+def parse_bb_layout1(lines):
+    re_val = re.compile(r"^(?P<val>\d{1,3}(?:\.\d{3})*,\d{2})\s+\((?P<pm>[+-])\)\s*$")
+    re_date = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+    rows = []
+    i = 0
+    N = len(lines)
+
+    while i < N:
+        m = re_val.match(lines[i])
+        if not m:
+            i += 1
+            continue
+
+        val = money_to_float(m.group("val"))
+        val = -abs(val) if m.group("pm") == "-" else abs(val)
+
+        j = i + 1
+        while j < N and not re_date.match(lines[j]):
+            j += 1
+        if j >= N:
+            break
+
+        dt = lines[j]
+        desc_parts = []
+        doc = ""
+        k = j + 1
+
+        while k < N and not re_val.match(lines[k]):
+            ln = lines[k]
+            if re_date.match(ln):
+                break
+            if ln.lower() in {"extrato de conta corrente", "lançamentos", "dia", "lote", "documento", "histórico", "valor", "cliente"}:
+                k += 1
+                continue
+            if re.fullmatch(r"\d{4,}", ln):
+                if not doc:
+                    doc = ln
+                k += 1
+                continue
+            if "saldo" in ln.lower():
+                k += 1
+                continue
+            desc_parts.append(ln)
+            k += 1
+
+        desc = norm_space(" ".join(desc_parts))
+        if desc:
+            rows.append([dt, desc, doc, val])
+
+        i = k
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]), doc_cleaner=clean_document_token_flexible)
+
+
+def parse_bb_layout2(lines):
+    re_date = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
+    re_money_cd = re.compile(r"^(?P<val>\d{1,3}(?:\.\d{3})*,\d{2})\s+(?P<dc>[CD])$")
+    rows = []
+    i = 0
+    N = len(lines)
+
+    while i < N:
+        if not re_date.match(lines[i]):
+            i += 1
+            continue
+
+        dt = datetime.strptime(lines[i].replace(".", "/"), "%d/%m/%Y").strftime("%d/%m/%Y")
+        block = []
+        j = i + 1
+        while j < N and not re_date.match(lines[j]):
+            if lines[j]:
+                block.append(lines[j].strip())
+            j += 1
+
+        if not block or any("saldo anterior" in b.lower() for b in block):
+            i = j
+            continue
+
+        val = None
+        val_idx = None
+        for idx_b, b in enumerate(block):
+            m = re_money_cd.match(b)
+            if m and m.group("val") != "0,00":
+                val = money_to_float(m.group("val"))
+                val = -abs(val) if m.group("dc") == "D" else abs(val)
+                val_idx = idx_b
+                break
+
+        if val is None:
+            i = j
+            continue
+
+        pre_value_block = block[:val_idx]
+        doc = extract_document_from_block(pre_value_block)
+        desc_parts = []
+        for b in pre_value_block:
+            low = b.lower()
+
+            if low in {
+                "origem", "banco", "lote", "saldo - r$", "valor - r$", "documento", "histórico",
+                "agência (prefixo/dv)", "conta nº / dv", "posição", "data da emissão", "data lançamento",
+                "folha", "data contábil", "correntista", "extrato conta corrente", "nome", "data da abertura",
+                "cnpj", "cpf"
+            }:
+                continue
+
+            if clean_document_token(b) == doc:
+                continue
+
+            if re.fullmatch(r"\d{1,6}", b) or re.fullmatch(r"[\d\.]{1,10}", b):
+                continue
+
+            desc_parts.append(b)
+
+        desc = norm_space(" ".join(desc_parts))
+        if desc and desc != "0,00":
+            rows.append([dt, desc, doc, val])
+
+        i = j
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]))
+
+def parse_bb_layout3(lines):
+    re_date = re.compile(r"^\d{2}\.\d{2}\.\d{4}$")
+    re_amt = re.compile(r"^(?P<amt>\d{1,3}(?:\.\d{3})*,\d{2})\s+(?P<dc>[CD])$")
+    rows = []
+    i = 0
+    N = len(lines)
+
+    while i < N:
+        if not re_date.match(lines[i]):
+            i += 1
+            continue
+
+        dt = datetime.strptime(lines[i].replace(".", "/"), "%d/%m/%Y").strftime("%d/%m/%Y")
+        j = i + 1
+
+        if j < N and re.fullmatch(r"\d{1,4}", lines[j]):
+            j += 1  # coluna Origem opcional
+            while j < N and lines[j].lower() in {"origem", "histórico", "historico", "documento", "lote"}:
+                j += 1
+
+        if j >= N:
+            break
+
+        hist = norm_space(lines[j])
+        if is_balance_or_summary_line(hist):
+            i = j + 1
+            continue
+        j += 1
+
+        doc = ""
+        if j < N and re.fullmatch(r"[A-Za-z0-9./-]{3,25}", lines[j]):
+            cand = norm_space(lines[j])
+            if j + 1 < N and re.fullmatch(r"\d{3,6}", lines[j + 1]):
+                doc = clean_document_token_flexible(cand) or cand
+                j += 1
+            elif j + 1 < N and re_amt.match(lines[j + 1]):
+                doc = clean_document_token_flexible(cand)
+                j += 1
+
+        if j < N and re.fullmatch(r"\d{3,6}", lines[j]):
+            j += 1
+        if j >= N:
+            break
+
+        m = re_amt.match(lines[j])
+        if not m:
+            i += 1
+            continue
+
+        val = money_to_float(m.group("amt"))
+        val = -abs(val) if m.group("dc") == "D" else abs(val)
+
+        rows.append([dt, hist, doc, val])
+        i = j + 1
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]), doc_cleaner=clean_document_token_flexible)
+
+def parse_bb_layout4(lines):
+    date_re = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+    val_line_re = re.compile(
+        r"^(?:(?P<doc>[\d./-]{3,25})\s+)?(?P<amt>\d{1,3}(?:\.\d{3})*,\d{2})\s+(?P<dc>[CD])"
+        r"(?:\s+\d{1,3}(?:\.\d{3})*,\d{2}\s+[CD])?$"
+    )
+    rows = []
+    i = 0
+    N = len(lines)
+
+    while i < N:
+        if not date_re.match(lines[i]):
+            i += 1
+            continue
+
+        dt = lines[i]
+        j = i + 1
+        while j < N and date_re.match(lines[j]):
+            dt = lines[j]
+            j += 1
+
+        block = []
+        while j < N and not date_re.match(lines[j]):
+            ln = lines[j].strip()
+            if ln:
+                block.append(ln)
+            j += 1
+
+        if not block or "saldo anterior" in " ".join(block).lower():
+            i = j
+            continue
+
+        val = None
+        val_idx = None
+        doc = ""
+        for idx_b, b in enumerate(block):
+            m = val_line_re.match(b)
+            if m and m.group("amt") != "0,00":
+                val = money_to_float(m.group("amt"))
+                val = -abs(val) if m.group("dc") == "D" else abs(val)
+                val_idx = idx_b
+                doc = clean_document_token_flexible(m.group("doc") or "")
+                break
+
+        if val is None:
+            i = j
+            continue
+
+        pre_value_block = block[:val_idx]
+        post_value_block = block[val_idx + 1:]
+
+        if not doc:
+            doc = extract_document_from_block(pre_value_block)
+        if not doc and pre_value_block:
+            tail = norm_space(pre_value_block[-1])
+            if re.fullmatch(r"[\d./-]{3,25}", tail):
+                doc = clean_document_token_flexible(tail) or tail
+
+        desc_parts = []
+        for b in pre_value_block + post_value_block:
+            low = b.lower()
+            if "saldo" in low:
+                continue
+            if low in {"lançamentos", "dt. balancete", "dt. movimento ag. origem lote histórico", "documento", "valor r$", "saldo"}:
+                continue
+            if b == "0000":
+                continue
+            if doc and norm_space(b) == doc:
+                continue
+            if re.fullmatch(r"[\d./-]{3,25}", b) and (clean_document_token_flexible(b) or b == doc):
+                continue
+            b2 = re.sub(r"^\d+\s+\d+\s+", "", b).strip()
+            b2 = re.sub(r"\s+\d{1,3}(?:\.\d{3})*,\d{2}\s+[CD](?:\s+\d{1,3}(?:\.\d{3})*,\d{2}\s+[CD])?$", "", b2).strip()
+            if doc and b2.endswith(doc):
+                b2 = b2[:-len(doc)].strip(' -')
+            if b2 and not is_balance_or_summary_line(b2):
+                desc_parts.append(b2)
+
+        desc = norm_space(" ".join(desc_parts))
+        if desc and "saldo" not in desc.lower() and desc.replace(" ", "").lower() != "saldo":
+            rows.append([dt, desc, doc, val])
+
+        i = j
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]), doc_cleaner=clean_document_token_flexible)
+
+def parse_bb_payments_report(lines):
+    re_row = re.compile(r"^(?P<date>\d{2}/\d{2}/\d{4})\s+(?P<name>.+)$")
+    re_val = re.compile(r"^R\$\s*(?P<val>\d{1,3}(?:\.\d{3})*,\d{2})$")
+    rows = []
+    cur = None
+    buf = []
+    i = 0
+    N = len(lines)
+
+    while i < N:
+        ln = lines[i]
+        m = re_row.match(ln)
+        if m:
+            cur = m.group("date")
+            buf = [m.group("name")]
+            i += 1
+            continue
+
+        mv = re_val.match(ln)
+        if mv and cur and buf:
+            rows.append([cur, norm_space(" ".join(buf)), "", -abs(money_to_float(mv.group("val")))])
+            cur = None
+            buf = []
+            i += 1
+            continue
+
+        if cur:
+            if re.match(r"^(CNPJ|CPF)\s*:", ln, re.I) or ln.lower().startswith(("bco:", "ag:", "conta:")) or ln.isdigit():
+                i += 1
+                continue
+            buf.append(ln)
+
+        i += 1
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]))
+
+
+def parse_bb_auto(lines):
+    candidates = [
+        ("bb_layout1", parse_bb_layout1(lines)),
+        ("bb_layout2", parse_bb_layout2(lines)),
+        ("bb_layout3", parse_bb_layout3(lines)),
+        ("bb_layout4", parse_bb_layout4(lines)),
+        ("bb_report", parse_bb_payments_report(lines)),
+    ]
+    return max(candidates, key=lambda t: len(t[1]))
+
+
+# ---------------- ABC ----------------
+
+def parse_abc(lines):
+    date_re = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+    money_re = re.compile(r"^-?\d{1,3}(?:\.\d{3})*,\d{2}$")
+    rows = []
+    i = 0
+    N = len(lines)
+
+    while i < N:
+        if not date_re.match(lines[i]):
+            i += 1
+            continue
+
+        dt = lines[i]
+        if i + 2 < N and "SALDO ANTERIOR" in lines[i + 2].upper():
+            i += 1
+            continue
+
+        doc = "" if i + 1 >= N or lines[i + 1] == "-" else lines[i + 1]
+        j = i + 2
+        desc_parts = []
+        val = None
+
+        while j < N:
+            ln = lines[j]
+            if date_re.match(ln):
+                break
+
+            if ln.lower() in {"credito", "crédito", "debito", "débito"}:
+                k = j + 1
+                while k < N and (lines[k] == "-" or not money_re.match(lines[k])):
+                    if date_re.match(lines[k]):
+                        break
+                    k += 1
+                if k < N and money_re.match(lines[k]):
+                    val = money_to_float(lines[k])
+                j = k + 1
+                break
+
+            if ln.lower() in {"data", "nro. documento", "histórico", "historico", "operação", "operacao", "valor (r$)", "saldo diário (r$)", "saldo diario (r$)"} or ln == "-":
+                j += 1
+                continue
+
+            desc_parts.append(ln)
+            j += 1
+
+        if val is not None:
+            rows.append([dt, norm_space(" ".join(desc_parts)), doc, val])
+
+        i = j if j > i else i + 1
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]))
+
+
+# ---------------- Banrisul ----------------
+
+def parse_banrisul_layout1(lines):
+    """Parser Banrisul do baseline v51.
+
+    Mantém a compatibilidade com o layout já estabilizado, cuja competência
+    vem em linha "PERIODO:" / "PERÍODO:".
+    """
+    mes = None
+    ano = None
+    for ln in lines:
+        if "PERIODO:" in ln.upper() or "PERÍODO:" in ln.upper():
+            try:
+                periodo = ln.split(":", 1)[1].strip()
+                nome_mes, a = periodo.split("/")
+                ano = int(re.sub(r"\D", "", a))
+                mes = MESES_BAN.get(nome_mes.strip().upper())
+            except Exception:
+                pass
+            break
+
+    if not (mes and ano):
+        return standardize(pd.DataFrame(columns=["Data", "Descrição", "Documento", "Valor"]))
+
+    rows = []
+    dia = None
+    padrao = re.compile(r"^\d{1,3}(?:\.\d{3})*,\d{2}-?$")
+
+    for ln in lines:
+        t = ln.strip()
+        if not t:
+            continue
+        up = t.upper()
+        if any(k in up for k in ["SALDO ANT", "SALDO NA DATA", "MOVIMENTOS", "DIA HISTORICO"]):
+            continue
+
+        m = re.match(r"^(\d{2})\s+(.*)", t)
+        if m:
+            dia = int(m.group(1))
+            restante = m.group(2)
+        else:
+            if dia is None:
+                continue
+            restante = t
+
+        parts = restante.split()
+        if len(parts) < 2 or not padrao.match(parts[-1]):
+            continue
+
+        val = money_to_float(parts[-1])
+        if "saldo" in restante.lower():
+            continue
+
+        doc = ""
+        desc_tokens = parts[:-1]
+        if desc_tokens and clean_document_token(desc_tokens[-1]):
+            doc = clean_document_token(desc_tokens[-1])
+            desc_tokens = desc_tokens[:-1]
+        desc = " ".join(desc_tokens)
+
+        dt = datetime(ano, mes, dia).strftime("%d/%m/%Y")
+        rows.append([dt, desc, doc, val])
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]))
+
+
+def parse_banrisul_layout2(lines):
+    """Parser Banrisul layout II, incorporado sobre o baseline v51.
+
+    Layout observado:
+      B A N R I S U L - DEZEMBRO /2021 - PAG. 1
+      DIA OP DOC SIS HISTORICO VALOR SALDO ORIG R*
+      01 1058 000010 BEH OP.CREDITO C/PENHOR 1.809,38
+         1325 211813 BDX DEBITO TRANSFERENCIA 171,90-
+         CPF/CNPJ DESTINO 00090205960049
+         AGENCIA DESTINO 0165
+         CONTA DESTINO 0805952609
+
+    A rotina é isolada: não altera OFX, não altera standardize() e não
+    interfere nos demais bancos. Linhas de saldo, transporte, rodapé e taxa
+    informativa de último dia são descartadas; linhas complementares de
+    contraparte/destino são agregadas à descrição do lançamento imediatamente
+    anterior, sem gerar novas transações.
+    """
+    month_re = re.compile(
+        r"(?:B\s*A\s*N\s*R\s*I\s*S\s*U\s*L\s*-\s*)?"
+        r"(JANEIRO|FEVEREIRO|MARCO|MARÇO|ABRIL|MAIO|JUNHO|JULHO|AGOSTO|SETEMBRO|OUTUBRO|NOVEMBRO|DEZEMBRO)"
+        r"\s*/\s*(\d{4})",
+        re.I,
+    )
+
+    # Alguns PDFs trazem mais de um lançamento na mesma linha, ou uma linha
+    # complementar seguida de novo lançamento. Este marcador permite fatiar
+    # essas ocorrências antes da interpretação.
+    tx_start_re = re.compile(r"(?<!\S)(?:(?:\d{2})\s+)?\d{4}\s+\d{6}\s+[A-Z]{3}\s+")
+
+    tx_day_re = re.compile(
+        r"^(?P<day>\d{2})\s+(?P<op>\d{4})\s+(?P<doc>\d{6})\s+(?P<sis>[A-Z]{3})\s+"
+        r"(?P<hist>.+?)\s+(?P<val>\d{1,3}(?:\.\d{3})*,\d{2}-?)(?P<trail>.*)$"
+    )
+    tx_noday_re = re.compile(
+        r"^(?P<op>\d{4})\s+(?P<doc>\d{6})\s+(?P<sis>[A-Z]{3})\s+"
+        r"(?P<hist>.+?)\s+(?P<val>\d{1,3}(?:\.\d{3})*,\d{2}-?)(?P<trail>.*)$"
+    )
+
+    skip_contains = [
+        "SALDO", "TRANSPORTE", "DATA REFERENCIA", "DATA REFERÊNCIA", "LIM=", "TAXA=", "CET=",
+        "DIA OP DOC", "BDPRVU", "CONTINUA", "FIM DE EXTRATO", "SAC -", "OUVIDORIA",
+        "R* =", "TX JR", "TX ULT", "EXT ANT", "DATA ALT",
+    ]
+
+    complemento_prefixes = (
+        "CPF/CNPJ DESTINO", "CPF/CNPJ REMETENTE", "CPF/CNPJ ",
+        "CNPJ-CPF DO REMETENTE", "AGENCIA DESTINO", "AGÊNCIA DESTINO",
+        "CONTA DESTINO", "AGENCIA CONTA DESTINO", "AGÊNCIA CONTA DESTINO",
+    )
+
+    def split_embedded_transactions(t: str):
+        """Divide linhas que contêm complemento + novo lançamento ou dois lançamentos."""
+        starts = [m.start() for m in tx_start_re.finditer(t)]
+        if not starts:
+            return [t]
+        parts = []
+        last = 0
+        for pos in starts:
+            if pos > last:
+                pre = t[last:pos].strip()
+                if pre:
+                    parts.append(pre)
+            last = pos
+        tail = t[last:].strip()
+        if tail:
+            parts.append(tail)
+        return parts or [t]
+
+    def is_complement_line(t: str) -> bool:
+        up = t.upper()
+        return any(up.startswith(p) for p in complemento_prefixes)
+
+    def clean_trailing_complement(trail: str) -> str:
+        trail = norm_space(trail)
+        if not trail:
+            return ""
+        # Sinalizador isolado observado em juros do Banrisul, não é complemento.
+        if trail.upper() == "S":
+            return ""
+        return trail if is_complement_line(trail) else ""
+
+    def append_complement(idx: int, comp: str):
+        comp = norm_space(comp)
+        if idx is None or idx < 0 or not comp:
+            return
+        if any(marker in comp.upper() for marker in skip_contains):
+            return
+        if not is_complement_line(comp):
+            return
+        # Evita duplicar a mesma informação quando o PDF repetir/mesclar linhas.
+        atual = rows[idx][1]
+        if comp not in atual:
+            rows[idx][1] = norm_space(atual + " | " + comp)
+
+    rows = []
+    mes = None
+    ano = None
+    dia_atual = None
+    last_idx = None
+
+    # Expande as linhas antes de interpretar, para lidar com extrações do tipo:
+    # "CPF/CNPJ DESTINO ... 1207 300321 BJR ...".
+    expanded_lines = []
+    for raw in lines:
+        t0 = norm_space(raw)
+        if not t0:
+            continue
+        expanded_lines.extend(split_embedded_transactions(t0))
+
+    for t in expanded_lines:
+        if not t:
+            continue
+        up = t.upper()
+
+        mh = month_re.search(up)
+        if mh:
+            mes = MESES_BAN.get(mh.group(1).upper())
+            try:
+                ano = int(mh.group(2))
+            except Exception:
+                ano = None
+            dia_atual = None
+            last_idx = None
+            continue
+
+        if not (mes and ano):
+            continue
+
+        if any(marker in up for marker in skip_contains):
+            continue
+
+        if is_complement_line(t):
+            append_complement(last_idx, t)
+            continue
+
+        m = tx_day_re.match(t)
+        if m:
+            try:
+                dia_atual = int(m.group("day"))
+            except Exception:
+                dia_atual = None
+                last_idx = None
+                continue
+            dia = dia_atual
+        else:
+            m = tx_noday_re.match(t)
+            if not m or dia_atual is None:
+                continue
+            dia = dia_atual
+
+        try:
+            data = datetime(ano, mes, dia).strftime("%d/%m/%Y")
+            valor = money_to_float(m.group("val"))
+        except Exception:
+            last_idx = None
+            continue
+
+        descricao = norm_space(f"{m.group('sis')} {m.group('hist')}")
+        trailing = clean_trailing_complement(m.group("trail") or "")
+        if trailing:
+            descricao = norm_space(descricao + " | " + trailing)
+
+        documento = norm_space(m.group("doc"))
+        rows.append([data, descricao, documento, valor])
+        last_idx = len(rows) - 1
+
+    return standardize(
+        pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]),
+        doc_cleaner=lambda x: norm_space(str(x))[:80]
+    )
+
+def parse_banrisul(lines):
+    # Primeiro tenta o layout Banrisul já estabilizado na v51.
+    df_layout1 = parse_banrisul_layout1(lines)
+    if not df_layout1.empty:
+        return df_layout1
+
+    # Se o layout antigo não se aplica, tenta o layout II.
+    return parse_banrisul_layout2(lines)
+
+
+
+# ---------------- Sicredi ----------------
+
+
+def parse_sicredi_table(pdf_path, pdf_password=None):
+    if pdfplumber is None:
+        return pd.DataFrame(columns=["Data", "Descrição", "Documento", "Valor", "Tipo", "Débito", "Crédito"])
+
+    def group_words_by_line(words, tol=1.2):
+        words = sorted(words, key=lambda w: (w["top"], w["x0"]))
+        groups = []
+        current = []
+        current_top = None
+        for w in words:
+            top = float(w["top"])
+            if current_top is None or abs(top - current_top) <= tol:
+                current.append(w)
+                current_top = top if current_top is None else (current_top + top) / 2.0
+            else:
+                groups.append(sorted(current, key=lambda z: z["x0"]))
+                current = [w]
+                current_top = top
+        if current:
+            groups.append(sorted(current, key=lambda z: z["x0"]))
+        return groups
+
+    rows = []
+    date_re = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+    money_re = re.compile(r"^\d{1,3}(?:\.\d{3})*,\d{2}$")
+
+    with pdfplumber.open(pdf_path, password=pdf_password) as pdf:
+        for page in pdf.pages:
+            words = page.extract_words(x_tolerance=1, y_tolerance=2, keep_blank_chars=False) or []
+            for group in group_words_by_line(words):
+                texts = [w["text"] for w in group]
+                if not texts:
+                    continue
+
+                first = texts[0]
+                if first == "**/**/****":
+                    continue
+                if not date_re.match(first):
+                    continue
+
+                date = first
+                doc_parts = [w["text"] for w in group if 78 <= w["x0"] < 125]
+                hist_parts = [w["text"] for w in group if 125 <= w["x0"] < 365]
+                money_words = [w for w in group if w["x0"] >= 365 and money_re.match(w["text"])]
+                money_words = sorted(money_words, key=lambda z: z["x0"])
+
+                doc = norm_space(" ".join(doc_parts))
+                hist = norm_space(" ".join(hist_parts))
+
+                if doc and not clean_document_token_sicredi(doc):
+                    hist = norm_space((doc + " " + hist).strip())
+                    doc = ""
+
+                if not hist:
+                    continue
+
+                hist_low = hist.lower()
+                if any(x in hist_low for x in ["saldo anterior", "d e t r a n s p o r t e", "saldo total", "saldo do dia"]):
+                    continue
+                if doc.lower() in {"data", "documento", "historico", "debito", "credito", "saldo"}:
+                    continue
+
+                if not money_words:
+                    continue
+
+                amount_word = money_words[0]
+                # quando houver duas quantias, a segunda costuma ser o saldo
+                if len(money_words) >= 2:
+                    amount_word = money_words[0]
+
+                amount_txt = amount_word["text"]
+                if amount_word["x0"] < 450:
+                    val = -abs(money_to_float(amount_txt))
+                else:
+                    val = abs(money_to_float(amount_txt))
+
+                rows.append([date, hist, doc, val])
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]),
+                      doc_cleaner=clean_document_token_sicredi)
+
+
+def parse_sicredi(lines, pdf_path=None, pdf_password=None):
+    joined = " ".join(lines[:120]).lower()
+    if pdf_path and "data documento historico debito credito saldo" in joined and "extrato de conta corrente" in joined:
+        return parse_sicredi_table(pdf_path, pdf_password=pdf_password)
+
+    return parse_sicredi_generic(lines)
+
+def parse_sicredi_generic(lines):
+    rows = []
+    i = 0
+    N = len(lines)
+    date_line = re.compile(r'^(?P<date>\d{2}/\d{2}/\d{4})(?:\s+(?P<rest>.+))?$')
+    money_re = re.compile(r'^-?\d{1,3}(?:\.\d{3})*,\d{2}$')
+    money_pair_re = re.compile(r'^(?P<amt>-?\d{1,3}(?:\.\d{3})*,\d{2})\s+(?P<saldo>-?\d{1,3}(?:\.\d{3})*,\d{2})$')
+    headers = {"Data", "Descrição", "Documento", "Valor (R$)", "Saldo (R$)", "Extrato", "SALDO", "SALDO ANTERIOR"}
+    skip_prefixes = ("Associado:", "Cooperativa:", "Conta Corrente:", "Conta:", "Dados referentes ao período", "Extrato (Período", "Impresso em", "Sicredi Fone", "SAC ", "Ouvidoria")
+
+    while i < N:
+        ln = lines[i]
+        if ln in headers or any(ln.startswith(p) for p in skip_prefixes):
+            i += 1
+            continue
+        if ln in {"SALDO", "SALDO ANTERIOR"}:
+            i += 2
+            continue
+
+        m = date_line.match(ln)
+        if not m:
+            i += 1
+            continue
+
+        dt = m.group('date')
+        rest = (m.group('rest') or '').strip()
+
+        j = i + 1
+        block = [rest] if rest else []
+        while j < N:
+            cur = lines[j]
+            if cur in headers or any(cur.startswith(p) for p in skip_prefixes):
+                j += 1
+                continue
+            if cur in {"SALDO", "SALDO ANTERIOR"}:
+                break
+            if date_line.match(cur):
+                break
+            block.append(cur)
+            j += 1
+
+        block = [b for b in block if b and not is_balance_or_summary_line(b)]
+
+        amt = None
+        amt_idx = None
+        for idx, b in enumerate(block):
+            mp = money_pair_re.match(b)
+            if mp:
+                amt = money_to_float(mp.group('amt'))
+                amt_idx = idx
+                break
+            if money_re.match(b):
+                amt = money_to_float(b)
+                amt_idx = idx
+                break
+
+        if amt is None:
+            i = j
+            continue
+
+        pre_value_block = block[:amt_idx]
+        doc = extract_document_from_block_sicredi(pre_value_block)
+        desc_parts = []
+        for b in pre_value_block:
+            if doc and norm_space(b) == doc:
+                continue
+            desc_parts.append(b)
+
+        desc = norm_space(" ".join(desc_parts))
+        if desc and not is_balance_or_summary_line(desc):
+            rows.append([dt, desc, doc, amt])
+
+        i = j
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]), doc_cleaner=clean_document_token_sicredi)
+
+# ---------------- Inter ----------------
+
+RE_INTER_DAY1 = re.compile(r"^(Segunda|Terça|Terca|Quarta|Quinta|Sexta|Sábado|Sabado|Domingo),\s+(\d{1,2})\s+de\s+([A-Za-zç]+)\s+de\s+(\d{4})$", re.I)
+RE_INTER_DAY2 = re.compile(r"^(\d{1,2})\s+de\s+([A-Za-zç]+)\s+de\s+(\d{4})(?:\s+Saldo do dia:.*)?$", re.I)
+RE_INTER_VAL = re.compile(r"^[+-]?R\$\s*\d{1,3}(?:\.\d{3})*,\d{2}$")
+RE_INTER_BAL = re.compile(r"^R\$\s*[-−]?\d{1,3}(?:\.\d{3})*,\d{2}$")
+
+def parse_inter(lines):
+    rows = []
+    current = None
+    desc_buf = []
+    i = 0
+    N = len(lines)
+
+    meta_starts = (
+        "solicitado em:", "cpf/cnpj:", "instituição:", "agência:", "conta:", "período",
+        "saldo total", "saldo disponível", "saldo bloqueado", "fale com a gente", "sac",
+        "ouvidoria", "deficiência"
+    )
+
+    while i < N:
+        ln = lines[i]
+        low = ln.lower()
+
+        if any(low.startswith(x) for x in meta_starts) or low in {"valor", "saldo por transação", "(bloqueado + disponível)", "(bloqueado + disponivel)"}:
+            i += 1
+            continue
+
+        m = RE_INTER_DAY1.match(ln) or RE_INTER_DAY2.match(ln)
+        if m:
+            if len(m.groups()) == 4:
+                day = int(m.group(2)); mon = m.group(3); year = m.group(4)
+            else:
+                day = int(m.group(1)); mon = m.group(2); year = m.group(3)
+            current = f"{day:02d}/{MESES_PT[mon.lower()]:02d}/{year}"
+            desc_buf = []
+            i += 1
+            continue
+
+        if current is None:
+            i += 1
+            continue
+
+        if low.startswith("saldo do dia"):
+            i += 1
+            continue
+
+        if RE_INTER_VAL.match(ln):
+            desc = norm_space(" ".join(desc_buf))
+            if desc:
+                rows.append([current, desc, "", money_to_float(ln)])
+            desc_buf = []
+            if i + 1 < N and RE_INTER_BAL.match(lines[i + 1]):
+                i += 2
+            else:
+                i += 1
+            continue
+
+        if RE_INTER_BAL.match(ln):
+            i += 1
+            continue
+
+        if not is_balance_or_summary_line(ln):
+            desc_buf.append(ln)
+        i += 1
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]))
+
+
+
+
+
+RE_SANT_DAY = re.compile(r"^(Segunda|Terça|Terca|Quarta|Quinta|Sexta|Sábado|Sabado|Domingo),\s+(\d{1,2})\s+de\s+([A-Za-zç]+)\s+de\s+(\d{4})$", re.I)
+
+# ---------------- Santander ----------------
+
+
+def _extract_trailing_doc_from_desc(desc: str, doc: str = ""):
+    desc = norm_space(desc)
+    doc = norm_space(doc)
+    if doc:
+        return desc, doc
+    m = re.match(r"^(?P<desc>.+?)\s+(?P<doc>\d{4,8})$", desc)
+    if m:
+        cand_doc = m.group("doc")
+        cand_desc = norm_space(m.group("desc"))
+        # Evita mover ano de competência para Documento em expressões como "OUTUBRO / 2021".
+        if re.fullmatch(r"(?:19|20)\d{2}", cand_doc) and cand_desc.rstrip().endswith("/"):
+            return desc, doc
+        if cand_desc.upper().endswith("FINAL"):
+            return desc, doc
+        return cand_desc, clean_document_token_flexible(cand_doc)
+    return desc, doc
+
+
+def parse_santander_layout1_from_lines(lines):
+    """Parser rápido para Santander layout1/3, inclusive PDFs consolidados com vários meses.
+
+    Usa as linhas já extraídas por PyMuPDF. O PDF costuma vir em fluxo vertical:
+    Data, descrição, documento ou '-', valor, saldo opcional. O parser percorre todos
+    os blocos "Movimentação" de conta corrente/contamax e ignora seções posteriores
+    como Saldos por Período, investimentos, cartões etc.
+    """
+    rows = []
+    re_resumo = re.compile(r"resumo\s*-\s*([A-Za-zçÇ]+)/\s*(\d{4})", re.I)
+    re_mes_ano = re.compile(r"^([A-Za-zçÇ]+)/(\d{4})$", re.I)
+    re_date = re.compile(r"^\d{2}/\d{2}$")
+    money_re = re.compile(r"^\d{1,3}(?:\.\d{3})*,\d{2}-?$")
+    # documento pode ser número, CPF/CNPJ, cheque, código etc.; '-' é placeholder da coluna.
+    doc_re = re.compile(r"^(?:-|\d{3,}|\d{1,3}(?:\.\d{3}){1,2}-?\d{0,2}|\d{2}\.\d{3}\.\d{3}/\d{4}-\d{2}|\d{3}\.\d{3}\.\d{3}-\d{2})$")
+
+    def clean_doc_sant(doc):
+        doc = norm_space(doc)
+        if not doc or doc == "-":
+            return ""
+        return doc
+
+    def is_header_or_noise(line):
+        low = line.lower()
+        if not line:
+            return True
+        if low.startswith("extrato_pj_") or low.startswith("balp_uy_") or low.startswith("pagina:"):
+            return True
+        if low in {"data", "descrição", "descricao", "nº documento", "no documento", "movimentos (r$)", "saldo (r$)", "créditos", "creditos", "débitos", "debitos"}:
+            return True
+        if low in {"conta corrente", "contamax", "movimentação", "movimentacao"}:
+            return True
+        if line.startswith('“') or line.startswith('"'):
+            return True
+        if any(x in low for x in [
+            "este demonstrativo", "central de atendimento", "sac", "ouvidoria", "redes sociais", "fale conosco",
+            "adiantamento a depositantes", "saldos por período", "saldos por periodo",
+            "relação de cheques", "relacao de cheques", "débito automático", "debito automatico",
+            "compras com cartão", "compras com cartao", "créditos contratados", "creditos contratados",
+            "cdb / rdb", "aplicação n°", "aplicacao n°", "valor principal", "valor bruto", "valor líquido", "valor liquido",
+            "movimentação mensal", "movimentacao mensal"
+        ]):
+            return True
+        return False
+
+    def parse_inline_transaction(text_line):
+        # Caso em que PDF traga tudo na mesma linha: descrição + doc opcional + valor + saldo opcional.
+        m = re.match(
+            r"^(?P<desc>.+?)\s+(?:(?P<doc>\d{4,}|-)\s+)?(?P<val>\d{1,3}(?:\.\d{3})*,\d{2}-?)(?:\s+\d{1,3}(?:\.\d{3})*,\d{2}-?)?$",
+            text_line
+        )
+        if not m:
+            return None
+        desc = norm_space(m.group('desc').strip(' -'))
+        if not re.search(r"[A-Za-zÀ-ÿ]", desc):
+            return None
+        doc = clean_doc_sant(m.group('doc') or "")
+        desc, doc = _extract_trailing_doc_from_desc(desc, doc)
+        val = money_to_float(m.group('val'))
+        return desc, doc, val
+
+    # fallback de ano: primeiro padrão mês/ano encontrado no arquivo
+    fallback_year = "2024"
+    for line in lines[:300]:
+        m = re.search(r"[A-Za-zçÇ]+/(\d{4})", line, re.I)
+        if m:
+            fallback_year = m.group(1)
+            break
+
+    year_ctx = None
+    current_date = None
+    in_mov = False
+    i = 0
+    N = len(lines)
+
+    while i < N:
+        line = norm_space(lines[i])
+        low = line.lower()
+
+        mr = re_resumo.search(line)
+        if mr:
+            year_ctx = mr.group(2)
+            in_mov = False
+            current_date = None
+            i += 1
+            continue
+        mm = re_mes_ano.match(line)
+        if mm:
+            year_ctx = mm.group(2)
+            i += 1
+            continue
+
+        if low in {"movimentação", "movimentacao"}:
+            nxt = " ".join(lines[i + 1:i + 12]).lower()
+            # entra apenas no bloco transacional da conta corrente/contamax
+            if "nº documento" in nxt and "movimentos (r$)" in nxt and "saldo (r$)" in nxt:
+                in_mov = True
+                current_date = None
+            i += 1
+            continue
+
+        if "saldos por período" in low or "saldos por periodo" in low:
+            in_mov = False
+            current_date = None
+            i += 1
+            continue
+
+        if not in_mov:
+            i += 1
+            continue
+
+        if is_header_or_noise(line):
+            i += 1
+            continue
+
+        if low.startswith("saldo em "):
+            # linha de saldo inicial/final; pula também o valor seguinte, se vier sozinho
+            i += 1
+            if i < N and money_re.match(norm_space(lines[i])):
+                i += 1
+            continue
+
+        if re_date.match(line):
+            current_date = f"{line}/{year_ctx or fallback_year}"
+            i += 1
+            continue
+
+        if current_date is None:
+            i += 1
+            continue
+
+        inline = parse_inline_transaction(line)
+        if inline:
+            desc, doc, val = inline
+            if desc and not is_balance_or_summary_line(desc):
+                rows.append([current_date, desc, doc, val])
+            i += 1
+            continue
+
+        # Fluxo vertical: descrição em uma ou mais linhas, doc/placeholder, valor, saldo opcional.
+        desc_parts = []
+        doc = ""
+        while i < N:
+            cur = norm_space(lines[i])
+            cur_low = cur.lower()
+            if re_date.match(cur) or "saldos por período" in cur_low or "saldos por periodo" in cur_low:
+                break
+            if is_header_or_noise(cur):
+                i += 1
+                continue
+            if cur_low.startswith("saldo em "):
+                break
+
+            # doc/placeholder imediatamente antes do valor.
+            # Exceção: anos isolados em complemento de histórico, como "OUTUBRO / 2021".
+            if doc_re.match(cur) and i + 1 < N and money_re.match(norm_space(lines[i + 1])):
+                if re.fullmatch(r"(?:19|20)\d{2}", cur) and desc_parts and desc_parts[-1].rstrip().endswith("/"):
+                    desc_parts.append(cur)
+                    i += 1
+                    continue
+                doc = clean_doc_sant(cur)
+                i += 1
+                continue
+
+            if money_re.match(cur):
+                desc = norm_space(" ".join(desc_parts))
+                desc, doc = _extract_trailing_doc_from_desc(desc, doc)
+                val = money_to_float(cur)
+                if desc and not is_balance_or_summary_line(desc):
+                    rows.append([current_date, desc, doc, val])
+                i += 1
+                # saldo opcional após o valor da transação
+                if i < N and money_re.match(norm_space(lines[i])):
+                    i += 1
+                break
+
+            desc_parts.append(cur)
+            i += 1
+        else:
+            i += 1
+            continue
+
+        # se não consumiu nada por alguma quebra, avança para evitar loop
+        if i < N and (re_date.match(norm_space(lines[i])) or "saldos por período" in norm_space(lines[i]).lower() or "saldos por periodo" in norm_space(lines[i]).lower()):
+            continue
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]),
+                      doc_cleaner=clean_document_token_flexible)
+
+
+def parse_santander_layout1_multiblock_fitz(pdf_path, pdf_password=None):
+    """Parser complementar para PDFs Santander layout1/3 muito longos,
+    nos quais cada página pode iniciar com continuação de movimentação sem repetir a data.
+    Usa PyMuPDF por desempenho em documentos extensos.
+    """
+    re_resumo = re.compile(r"resumo\s*-\s*([A-Za-zçÇ]+)/\s*(\d{4})", re.I)
+    re_mes_ano = re.compile(r"^([A-Za-zçÇ]+)/(\d{4})$", re.I)
+    re_date = re.compile(r'^(?P<data>\d{2}/\d{2})(?:\s+(?P<rest>.+))?$')
+    money_pat = r'\d{1,3}(?:\.\d{3})*,\d{2}-?'
+    re_money = re.compile(rf'^{money_pat}$')
+    re_doc = re.compile(r'^(?:\d{4,}|-|[0-9]{3}/[0-9]{4,})$')
+    re_tx = re.compile(rf'^(?P<desc>.+?)\s+(?P<doc>\d{{4,}}|-)\s+(?P<val>{money_pat})(?:\s+(?P<saldo>{money_pat}))?$')
+    re_tx_nodoc = re.compile(rf'^(?P<desc>.+?)\s+(?P<val>{money_pat})(?:\s+(?P<saldo>{money_pat}))?$')
+    tx_prefix = re.compile(
+        r"^(PIX|TRANSF|TRANSFER|TARIFA|TED|DOC|PAGAMENTO|PGTO|A CR|CR COB|RESGATE|APLICACAO|APLICAÇÃO|"
+        r"ANTECIPACAO|ANTECIPAÇÃO|COMPRA|DEBITO|DÉBITO|MENSALIDADE|PREST|IOF|JUROS|OPERACAO|OPERAÇÃO|"
+        r"CHEQUE|ESTORNO)",
+        re.I
+    )
+
+    def noise(line):
+        low = line.lower()
+        if not line:
+            return True
+        if low.startswith(("extrato_pj", "balp_uy", "pagina:")):
+            return True
+        if low in {
+            "extrato consolidado inteligente", "data", "descrição", "descricao", "nº documento", "no documento",
+            "movimentos (r$)", "saldo (r$)", "créditos", "creditos", "débitos", "debitos",
+            "conta corrente", "contamax", "movimentação", "movimentacao"
+        }:
+            return True
+        if line.startswith(("“", '"')):
+            return True
+        if any(x in low for x in [
+            "este demonstrativo", "central de atendimento", "sac", "ouvidoria", "redes sociais",
+            "fale conosco", "relação de cheques", "relacao de cheques", "débito automático",
+            "debito automatico", "compras com cartão", "compras com cartao",
+            "créditos contratados", "creditos contratados", "limite santander master"
+        ]):
+            return True
+        return False
+
+    rows = []
+    in_mov = False
+    year_ctx = None
+    current_date = None
+    pending = None
+
+    def finish(desc, doc, val, date):
+        desc = norm_space(desc)
+        doc = norm_space(doc)
+        if doc == "-":
+            doc = ""
+        desc, doc = _extract_trailing_doc_from_desc(desc, doc)
+        if desc and not is_balance_or_summary_line(desc):
+            rows.append([date, desc, doc, val])
+
+    def parse_complete(line, date):
+        m = re_tx.match(line)
+        if m:
+            finish(m.group("desc"), m.group("doc") or "", money_to_float(m.group("val")), date)
+            return True
+        m = re_tx_nodoc.match(line)
+        if m and re.search(r"[A-Za-zÀ-ÿ]", m.group("desc")):
+            finish(m.group("desc"), "", money_to_float(m.group("val")), date)
+            return True
+        return False
+
+    def looks_start(rest):
+        return bool(rest and (tx_prefix.search(rest) or re.search(rf'\s{money_pat}(?:\s+{money_pat})?$', rest)))
+
+    doc, _pw = open_pdf_with_password(pdf_path)
+    try:
+        for page in doc:
+            lines = [norm_space(l) for l in (page.get_text("text") or "").splitlines()]
+            lines = [l for l in lines if l]
+            for line in lines:
+                low = line.lower()
+
+                mr = re_resumo.search(line)
+                if mr:
+                    year_ctx = mr.group(2)
+                    in_mov = False
+                    current_date = None
+                    pending = None
+                    continue
+
+                mm = re_mes_ano.match(line)
+                if mm:
+                    year_ctx = mm.group(2)
+                    continue
+
+                if low in {"movimentação", "movimentacao"}:
+                    in_mov = True
+                    pending = None
+                    continue
+
+                if "saldos por período" in low or "saldos por periodo" in low:
+                    in_mov = False
+                    current_date = None
+                    pending = None
+                    continue
+
+                if not in_mov:
+                    continue
+
+                if noise(line):
+                    continue
+
+                if low.startswith("saldo em "):
+                    pending = None
+                    continue
+
+                md = re_date.match(line)
+                if md and year_ctx:
+                    candidate_date = f"{md.group('data')}/{year_ctx}"
+                    rest = (md.group("rest") or "").strip()
+                    if not rest:
+                        current_date = candidate_date
+                        pending = None
+                        continue
+                    if looks_start(rest):
+                        current_date = candidate_date
+                        pending = None
+                        if not parse_complete(rest, current_date):
+                            pending = {"date": current_date, "parts": [rest], "doc": ""}
+                        continue
+                    # Linha do tipo "16/09 BOURBON COUNTRY" costuma ser complemento de compra,
+                    # não nova data de lançamento. Não altera current_date.
+                    line = rest
+
+                if current_date is None:
+                    continue
+
+                if pending is not None:
+                    if re_money.match(line):
+                        finish(" ".join(pending["parts"]), pending.get("doc", ""), money_to_float(line), pending["date"])
+                        pending = None
+                        continue
+                    if re_doc.match(line) and not pending.get("doc"):
+                        pending["doc"] = line
+                        continue
+                    if not noise(line):
+                        pending["parts"].append(line)
+                        continue
+
+                if parse_complete(line, current_date):
+                    pending = None
+                    continue
+
+                if re.search(r"[A-Za-zÀ-ÿ]", line):
+                    pending = {"date": current_date, "parts": [line], "doc": ""}
+
+    finally:
+        doc.close()
+
+    df = pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"])
+    return standardize(df, doc_cleaner=clean_document_token_flexible)
+
+
+def parse_santander_layout1_from_pdf(pdf_path, pdf_password=None):
+    import pdfplumber, re, pandas as pd
+
+    # Documentos Santander muito longos podem trazer várias competências e páginas
+    # que começam com continuação de movimentação sem repetir a data.
+    # Para esses casos, usa parser page-aware em PyMuPDF.
+    try:
+        _doc_tmp, _pw_tmp = open_pdf_with_password(pdf_path)
+        _page_count = len(_doc_tmp)
+        _doc_tmp.close()
+        if _page_count > 80:
+            return parse_santander_layout1_multiblock_fitz(pdf_path, pdf_password=pdf_password)
+    except Exception:
+        pass
+
+    texto = ""
+    with pdfplumber.open(pdf_path, password=pdf_password) as pdf:
+        for page in pdf.pages:
+            t = page.extract_text()
+            if t:
+                texto += t + "\n"
+
+    linhas = [re.sub(r"\s{2,}", " ", l.strip()) for l in texto.splitlines() if l.strip()]
+
+    # Este layout pode aparecer como extrato de mês único ou como PDF consolidado
+    # com vários meses/anos. A versão antiga parava no primeiro "Saldos por Período";
+    # agora varremos todos os blocos "Movimentação" do documento.
+    re_resumo = re.compile(r"resumo\s*-\s*([A-Za-zçÇ]+)/\s*(\d{4})", re.I)
+    re_mes_ano = re.compile(r"^([A-Za-zçÇ]+)/(\d{4})$", re.I)
+    re_date = re.compile(r'^(?P<data>\d{2}/\d{2})(?:\s+(?P<rest>.+))?$')
+    re_tx = re.compile(
+        r'^(?P<desc>.+?)'
+        r'(?:\s+(?P<doc>\d{4,}|-))?'
+        r'\s+(?P<val>\d{1,3}(?:\.\d{3})*,\d{2}-?)'
+        r'(?:\s+(?P<saldo>\d{1,3}(?:\.\d{3})*,\d{2}-?))?$'
+    )
+    re_tail_value = re.compile(
+        r'^(?:(?P<doc>\d{4,}|-)\s+)?'
+        r'(?P<val>\d{1,3}(?:\.\d{3})*,\d{2}-?)'
+        r'(?:\s+(?P<saldo>\d{1,3}(?:\.\d{3})*,\d{2}-?))?$'
+    )
+
+    def is_noise_line(line: str) -> bool:
+        low = line.lower()
+        if not line:
+            return True
+        if low.startswith("extrato_pj_") or low.startswith("balp_uy_") or low.startswith("pagina:"):
+            return True
+        if low == "extrato consolidado inteligente":
+            return True
+        if low in {
+            "data descrição nº documento movimentos (r$) saldo (r$)",
+            "data descricao nº documento movimentos (r$) saldo (r$)",
+            "data descrição no documento movimentos (r$) saldo (r$)",
+            "créditos débitos", "creditos debitos", "créditos", "creditos", "débitos", "debitos",
+            "conta corrente", "contamax", "movimentação", "movimentacao"
+        }:
+            return True
+        if line.startswith('“') or line.startswith('"'):
+            return True
+        if any(x in low for x in [
+            "este demonstrativo", "central de atendimento", "sac", "ouvidoria", "redes sociais",
+            "adiantamento a depositantes", "jurosmoratórios", "jurosmoratorios", "produtocontratado",
+            "saldo devedor", "sujeito à cobrança", "sujeito a cobranca", "fale conosco",
+            "relação de cheques", "relacao de cheques", "débito automático", "debito automatico",
+            "compras com cartão", "compras com cartao", "créditos contratados", "creditos contratados"
+        ]):
+            return True
+        return False
+
+    def finish_pending(pending, doc, val):
+        if not pending:
+            return
+        desc = norm_space(" ".join(pending["parts"]))
+        doc = norm_space(doc or pending.get("doc", ""))
+        if doc == "-":
+            doc = ""
+        desc, doc = _extract_trailing_doc_from_desc(desc, doc)
+        if desc and not is_balance_or_summary_line(desc):
+            rows.append([pending["date"], desc, doc, val])
+
+    rows = []
+    in_mov = False
+    year_ctx = None
+    current_date = None
+    pending = None
+
+    # fallback: primeiro mês/ano presente no documento
+    mhead = re.search(r'([A-Za-zçÇ]+)/(\d{4})', texto, re.I)
+    fallback_year = mhead.group(2) if mhead else "2024"
+
+    for idx_line, raw_line in enumerate(linhas):
+        line = norm_space(raw_line)
+        low = line.lower()
+
+        mr = re_resumo.search(line)
+        if mr:
+            year_ctx = mr.group(2)
+            in_mov = False
+            current_date = None
+            pending = None
+            continue
+        mm = re_mes_ano.match(line)
+        if mm:
+            year_ctx = mm.group(2)
+            continue
+
+        if low in {"movimentação", "movimentacao"}:
+            # Só entra no bloco transacional de conta corrente/contamax.
+            # O PDF também contém seções de investimentos com o título "Movimentação",
+            # mas nelas o cabeçalho é outro (Valor Principal, Valor Bruto etc.).
+            next_block = " ".join(linhas[idx_line + 1: idx_line + 8]).lower()
+            if "data descrição nº documento movimentos" in next_block or "data descricao nº documento movimentos" in next_block:
+                in_mov = True
+                current_date = None
+                pending = None
+            continue
+
+        if "saldos por período" in low or "saldos por periodo" in low:
+            in_mov = False
+            current_date = None
+            pending = None
+            continue
+
+        if not in_mov:
+            continue
+
+        if is_noise_line(line):
+            continue
+        if low.startswith("saldo em "):
+            pending = None
+            continue
+
+        mdate = re_date.match(line)
+        if mdate:
+            current_date = f"{mdate.group('data')}/{year_ctx or fallback_year}"
+            rest = (mdate.group('rest') or "").strip()
+            pending = None
+            if not rest:
+                continue
+
+            mt = re_tx.match(rest)
+            if mt:
+                desc = mt.group('desc').strip(" -")
+                doc = mt.group('doc') or ""
+                if doc == "-":
+                    doc = ""
+                desc, doc = _extract_trailing_doc_from_desc(desc, doc)
+                val = money_to_float(mt.group('val'))
+                rows.append([current_date, desc, doc, val])
+            else:
+                pending = {"date": current_date, "parts": [rest], "doc": ""}
+            continue
+
+        if current_date is None:
+            continue
+
+        mt = re_tx.match(line)
+        if mt and re.search(r'[A-Za-zÀ-ÿ]', mt.group('desc') or ''):
+            pending = None
+            desc = mt.group('desc').strip(" -")
+            doc = mt.group('doc') or ""
+            if doc == "-":
+                doc = ""
+            desc, doc = _extract_trailing_doc_from_desc(desc, doc)
+            val = money_to_float(mt.group('val'))
+            rows.append([current_date, desc, doc, val])
+            continue
+
+        # continuação de uma descrição iniciada em linha com data, ou em linha anterior
+        if pending is not None:
+            mv = re_tail_value.match(line)
+            if mv:
+                doc = mv.group("doc") or ""
+                val = money_to_float(mv.group("val"))
+                finish_pending(pending, doc, val)
+                pending = None
+                continue
+            # linha de complemento de histórico/documento
+            if not is_noise_line(line) and not re.fullmatch(r'\d{1,3}(?:\.\d{3})*,\d{2}-?', line):
+                pending["parts"].append(line)
+            continue
+
+        # linha de continuação sem data, comum após a primeira transação do dia
+        # Ex.: descrição em uma linha, documento em outra e valor na seguinte.
+        if re.search(r'[A-Za-zÀ-ÿ]', line):
+            pending = {"date": current_date, "parts": [line], "doc": ""}
+            continue
+
+    df = pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"])
+    df = df[df["Valor"].notna()].copy()
+    return standardize(df, doc_cleaner=clean_document_token_flexible)
+
+def parse_santander_layout2(lines):
+    rows = []
+    current = None
+    i = 0
+    N = len(lines)
+
+    while i < N:
+        ln = lines[i]
+        m = RE_SANT_DAY.match(ln)
+        if m:
+            current = f"{int(m.group(2)):02d}/{MESES_PT[m.group(3).lower()]:02d}/{m.group(4)}"
+            i += 1
+            continue
+
+        if current is None:
+            i += 1
+            continue
+
+        if ln in {"CREDITO", "DEBITO"} or any(x in ln.lower() for x in ["solicitado em", "internet banking empresarial", "exibindo resultados", "para consultas abaixo", "agência:", "conta:", "banco santander"]):
+            i += 1
+            continue
+
+        if i + 2 < N and lines[i + 1] in {"CREDITO", "DEBITO"} and re.match(r"^[+-]?R\$\s*\d", lines[i + 2]):
+            tipo = lines[i + 1]
+            val = money_to_float(lines[i + 2])
+            val = -abs(val) if tipo == "DEBITO" else abs(val)
+            rows.append([current, ln, "", val])
+            i += 3
+            continue
+
+        i += 1
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]))
+
+
+def parse_santander(pdf_path, lines, pdf_password=None):
+    re_sant_day_local = re.compile(
+        r"^(Segunda|Terça|Terca|Quarta|Quinta|Sexta|Sábado|Sabado|Domingo),\s+(\d{1,2})\s+de\s+([A-Za-zç]+)\s+de\s+(\d{4})$",
+        re.I
+    )
+    if any(re_sant_day_local.match(ln) for ln in lines[:200]):
+        return parse_santander_layout2(lines)
+
+    # PDFs Santander layout1/3 com mês único continuam no parser antigo, já estabilizado.
+    # PDFs consolidados com vários meses/anos usam o parser por linhas, que percorre todos
+    # os blocos de Movimentação e não para no primeiro "Saldos por Período".
+    resumo_count = sum(1 for ln in lines if re.search(r"resumo\s*-", ln, re.I))
+    mov_tx_count = 0
+    for idx, ln in enumerate(lines):
+        if norm_space(ln).lower() in {"movimentação", "movimentacao"}:
+            nxt = " ".join(lines[idx + 1: idx + 12]).lower()
+            if "nº documento" in nxt and "movimentos (r$)" in nxt and "saldo (r$)" in nxt:
+                mov_tx_count += 1
+    if resumo_count > 1 or mov_tx_count > 1:
+        return parse_santander_layout1_multiblock_fitz(pdf_path, pdf_password=pdf_password)
+    return parse_santander_layout1_from_pdf(pdf_path, pdf_password=pdf_password)
+
+def detect_year(lines):
+    sample = " ".join(lines[:400]).lower()
+    m = re.search(r"\b(20\d{2})\b", sample)
+    return int(m.group(1)) if m else datetime.now().year
+
+
+
+def detect_itau_statement_year(lines):
+    """Infere o ano de competência de extratos Itaú.
+
+    Prioriza o período do extrato, pois alguns arquivos trazem no cabeçalho
+    a data/hora de emissão em ano posterior ao período movimentado.
+    """
+    sample = " ".join(lines[:160])
+
+    m = re.search(
+        r"Extrato\s+de\s+\d{2}/\d{2}/(20\d{2})\s+(?:até|ate)\s+\d{2}/\d{2}/(20\d{2})",
+        sample,
+        re.I,
+    )
+    if m:
+        return int(m.group(1))
+
+    for ln in lines[:80]:
+        m = re.search(r"\b([A-Za-zçÇ]+)/\s*(20\d{2})\b", ln)
+        if m:
+            return int(m.group(2))
+
+    return detect_year(lines)
+
+
+def is_itau_layout4_signature(txt: str) -> bool:
+    """Reconhece o layout ItaúEmpresas com Data/Lançamento/Ag. Origem/Valor/Saldo.
+
+    A identificação é estrutural para evitar dependência exclusiva da palavra Itaú,
+    que em alguns PDFs pode estar apenas no logotipo.
+    """
+    t = norm_space(txt).lower()
+    return (
+        "extrato de " in t
+        and "ag./origem" in t
+        and "valor (r$)" in t
+        and "saldo (r$)" in t
+        and ("lançamento" in t or "lancamento" in t)
+    )
+
+
+def is_itau_layout3_signature(txt: str) -> bool:
+    """Reconhece o layout Itaú com colunas Data/Lançamentos/Razão Social/CNPJ/CPF/Valor/Saldo.
+
+    A identificação é estrutural porque alguns PDFs trazem o logotipo Itaú como imagem,
+    sem a palavra ITAU/ITAÚ no texto extraído pelo PyMuPDF.
+    """
+    t = norm_space(txt).lower()
+    return (
+        "lançamentos do período:" in t or "lancamentos do periodo:" in t
+    ) and (
+        "razão social" in t or "razao social" in t
+    ) and (
+        "cnpj/cpf" in t
+    ) and (
+        "valor (r$)" in t
+    ) and (
+        "saldo (r$)" in t
+    )
+
+
+def is_itau_balance_description(desc: str) -> bool:
+    low = norm_space(desc).lower()
+    return any(x in low for x in [
+        "saldo anterior",
+        "saldo inicial",
+        "saldo final",
+        "saldo parcial",
+        "saldo total",
+        "saldo total disponível dia",
+        "saldo total disponivel dia",
+        "saldo movimentação conta",
+        "saldo movimentacao conta",
+        "saldo aplic",
+        "saldo aplicação",
+        "saldo aplicacao",
+        "saldo a liberar",
+        "saldo em conta corrente",
+    ])
+
+
+
+
+def parse_itau_layout2(lines):
+    year = None
+    for ln in lines[:40]:
+        m = re.search(r"\b([A-Za-zçÇ]+)/(\d{4})\b", ln)
+        if m:
+            try:
+                year = int(m.group(2))
+                break
+            except Exception:
+                pass
+    if year is None:
+        year = detect_year(lines)
+
+    date_re = re.compile(r"^\d{2}/\d{2}$")
+    money_re = re.compile(r"^\d{1,3}(?:\.\d{3})*,\d{2}(?:\s*-\s*)?$")
+    rows = []
+    i = 0
+    N = len(lines)
+
+    skip_desc_starts = (
+        "saldo inicial", "saldo anterior", "saldo final", "saldo parcial",
+        "saldo aplic", "saldo em "
+    )
+
+    while i < N:
+        ln = lines[i]
+        if not date_re.match(ln):
+            i += 1
+            continue
+
+        dt = datetime.strptime(f"{ln}/{year}", "%d/%m/%Y").strftime("%d/%m/%Y")
+        j = i + 1
+        if j >= N:
+            break
+
+        desc = norm_space(lines[j])
+        if not desc or desc.lower().startswith(skip_desc_starts):
+            i = j + 1
+            continue
+
+        j += 1
+        # coluna Orig opcional
+        if j < N and re.fullmatch(r"\d{3,6}", lines[j]):
+            j += 1
+
+        if j >= N or not money_re.match(lines[j]):
+            i += 1
+            continue
+
+        val = money_to_float(lines[j])
+        rows.append([dt, desc, "", val])
+
+        # consumir saldo subsequente, se houver
+        j += 1
+        if j < N and money_re.match(lines[j]):
+            j += 1
+
+        i = j
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]))
+
+
+
+def parse_itau_layout3(lines):
+    full_date_re = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+    money_re = re.compile(r"^-?\d{1,3}(?:\.\d{3})*,\d{2}$")
+    rows = []
+    i = 0
+    N = len(lines)
+
+    header_noise = {
+        "Data", "Lançamentos", "Lancamentos", "Razão Social", "Razao Social",
+        "CNPJ/CPF", "Valor (R$)", "Saldo (R$)"
+    }
+
+    while i < N:
+        ln = lines[i]
+        if not full_date_re.match(ln):
+            i += 1
+            continue
+
+        dt = ln
+        j = i + 1
+        desc_parts = []
+
+        while j < N:
+            cur = lines[j]
+            if full_date_re.match(cur):
+                break
+            if cur in header_noise:
+                j += 1
+                continue
+            if money_re.match(cur):
+                break
+            desc_parts.append(cur)
+            j += 1
+
+        if j >= N or not money_re.match(lines[j]):
+            i += 1
+            continue
+
+        desc = norm_space(" ".join(desc_parts))
+        val = money_to_float(lines[j])
+
+        if desc and not is_balance_or_summary_line(desc) and not is_itau_balance_description(desc):
+            rows.append([dt, desc, "", val])
+
+        i = j + 1
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]))
+
+
+def parse_itau_layout4(lines):
+    """Parser para Itaú layout4.
+
+    Layout observado:
+      - cabeçalho ItaúEmpresas;
+      - período no formato "Extrato de dd/mm/aaaa até dd/mm/aaaa";
+      - colunas: Data | Lançamento | Ag./Origem | Valor (R$) | Saldo (R$);
+      - datas das operações no formato dd/mm;
+      - Ag./Origem e Saldo (R$) são desprezados;
+      - linhas de saldo não devem virar transação.
+    """
+    year = detect_itau_statement_year(lines)
+    date_re = re.compile(r"^\d{2}/\d{2}$")
+    money_re = re.compile(r"^-?\d{1,3}(?:\.\d{3})*,\d{2}$")
+    rows = []
+    i = 0
+    N = len(lines)
+
+    header_noise = {
+        "ItaúEmpresas", "ItauEmpresas", "Data", "Lançamento", "Lancamento",
+        "Ag./Origem", "Valor (R$)", "Saldo (R$)"
+    }
+
+    while i < N:
+        ln = norm_space(lines[i])
+        if not date_re.match(ln):
+            i += 1
+            continue
+
+        try:
+            dt = datetime.strptime(f"{ln}/{year}", "%d/%m/%Y").strftime("%d/%m/%Y")
+        except Exception:
+            i += 1
+            continue
+
+        j = i + 1
+        desc_parts = []
+        while j < N:
+            cur = norm_space(lines[j])
+            if date_re.match(cur):
+                break
+            if cur in header_noise or re.fullmatch(r"\d+", cur):
+                j += 1
+                continue
+            if money_re.match(cur):
+                break
+            desc_parts.append(cur)
+            j += 1
+
+        if j >= N or not money_re.match(norm_space(lines[j])):
+            i += 1
+            continue
+
+        desc = norm_space(" ".join(desc_parts))
+
+        if desc and not is_balance_or_summary_line(desc) and not is_itau_balance_description(desc):
+            val = money_to_float(norm_space(lines[j]))
+            rows.append([dt, desc, "", val])
+
+        # Consome o valor da transação e, se existir, o saldo imediatamente subsequente.
+        j += 1
+        if j < N and money_re.match(norm_space(lines[j])):
+            j += 1
+
+        i = j
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]))
+
+def parse_itau(lines):
+    sample = " ".join(lines[:120]).lower()
+    if ("data lançamentos razão social cnpj/cpf valor (r$) saldo (r$)" in sample or
+        "data lancamentos razao social cnpj/cpf valor (r$) saldo (r$)" in sample or
+        is_itau_layout3_signature(sample)):
+        return parse_itau_layout3(lines)
+    if ("data lançamento ag./origem valor (r$) saldo (r$)" in sample or
+        "data lancamento ag./origem valor (r$) saldo (r$)" in sample or
+        is_itau_layout4_signature(sample)):
+        return parse_itau_layout4(lines)
+    if "data histórico de lançamentos orig valor (r$) saldo (r$)".lower() in sample or "data historico de lancamentos orig valor (r$) saldo (r$)" in sample:
+        return parse_itau_layout2(lines)
+
+    year = detect_year(lines)
+    rows = []
+    current = None
+    in_mov = False
+    i = 0
+    N = len(lines)
+
+    header_noise = (
+        "data", "descrição", "descricao", "entradas r$", "saídas r$", "saidas r$", "saldo r$",
+        "(créditos)", "(debitos)", "(débitos)", "a = agendamento", "b = ações movimentadas",
+        "c = crédito a compensar", "d = débito a compensar", "g = aplicação programada",
+        "p = poupança automática", "para demais siglas, consulte as notas", "explicativas no final do extrato"
+    )
+
+    while i < N:
+        ln = lines[i]
+        low = ln.lower()
+
+        if re.search(r"Conta\s+Corrente\s*\|\s*Movimenta", ln, re.I):
+            in_mov = True
+            current = None
+            i += 1
+            continue
+
+        if not in_mov:
+            i += 1
+            continue
+
+        # fim da seção correta
+        if re.search(r"^Conta\s+Corrente\s*\|\s*Aplica", ln, re.I):
+            break
+
+        # datas
+        if re.fullmatch(r"\d{2}/\d{2}", ln):
+            current = datetime.strptime(f"{ln}/{year}", "%d/%m/%Y")
+            i += 1
+            continue
+        if re.fullmatch(r"\d{2}/\d{2}/\d{4}", ln):
+            current = datetime.strptime(ln, "%d/%m/%Y")
+            i += 1
+            continue
+
+        if current is None:
+            i += 1
+            continue
+
+        # ignorar linhas de resumo / saldo
+        if low in header_noise or any(k in low for k in [
+            "saldo anterior", "saldo final", "saldo da conta corrente", "saldo total disponível",
+            "conta corrente | saldo", "conta corrente | cheque especial",
+            "saldo aplic aut", "saldo aplic aut mais", "saldo aplic", "saldo em c/c",
+            "entrada r$", "saída r$", "saida r$", "na conta corrente", "bruto", "líquido", "liquido", "total",
+            "totalizador de aplicações automáticas", "os valores referentes ao totalizador"
+        ]):
+            i += 1
+            continue
+
+        # descrição de transação dentro da seção movimentação
+        desc = ln
+
+        # descarte de linhas que são só número/resumo
+        if not re.search(r"[A-Za-zÀ-ÿ]", desc):
+            i += 1
+            continue
+
+        # próxima linha deve ser valor da transação
+        if i + 1 < N and re.fullmatch(r"\d{1,3}(?:\.\d{3})*,\d{2}-?", lines[i + 1]):
+            val = money_to_float(lines[i + 1])
+            rows.append([current.strftime("%d/%m/%Y"), desc, "", val])
+            i += 2
+            continue
+
+        i += 1
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]))
+
+def parse_efi(lines):
+    date_re = re.compile(r"^\d{2}/\d{2}/\d{4}$")
+    value_re = re.compile(r"^[+-]\d{1,3}(?:\.\d{3})*,\d{2}$")
+    rows = []
+    i = 0
+    N = len(lines)
+
+    while i < N:
+        if not date_re.match(lines[i]):
+            i += 1
+            continue
+
+        dt = lines[i]
+        if i + 1 < N and lines[i + 1].lower().startswith("saldo do dia"):
+            i += 3
+            continue
+
+        j = i + 1
+        desc_parts = []
+        doc = ""
+        val = None
+
+        while j < N and not date_re.match(lines[j]):
+            ln = lines[j]
+            low = ln.lower()
+
+            if any(x in low for x in [
+                "efí s.a.", "ouvidoria:", "tecbiz - tecnologia", "banco 364", "agência ",
+                "período", "tipo de saldo", "tipo de transação", "filtros aplicados",
+                "relatório gerado em", "todos"
+            ]) or ln in {"Valor", "Descrição", "Data", "Protocolo", "Valor (R$)", "Lançamentos", "Extrato ﬁnanceiro", "Extrato financeiro"}:
+                j += 1
+                continue
+
+            if re.fullmatch(r"\d{6,}", ln):
+                doc = ln
+                j += 1
+                continue
+
+            if value_re.match(ln):
+                val = money_to_float(ln)
+                rows.append([dt, norm_space(" ".join(desc_parts)), doc, val])
+                j += 1
+                break
+
+            desc_parts.append(ln)
+            j += 1
+
+        i = j
+
+    return standardize(pd.DataFrame(rows, columns=["Data", "Descrição", "Documento", "Valor"]))
+
+
+
+
+# ---------------- Unicred ----------------
+
+try:
+    import pdfplumber
+except Exception:
+    pdfplumber = None
+
+def parse_unicred(pdf_path, pdf_password=None):
+    # parser fiel ao script individual, com adaptação para saída padronizada
+    if pdfplumber is None:
+        return pd.DataFrame(columns=["Data", "Descrição", "Documento", "Valor", "Tipo", "Débito", "Crédito"])
+
+    import itertools
+    from decimal import Decimal, ROUND_HALF_UP
+
+    TOL = Decimal("0.01")
+
+    def br_to_decimal(valor_str):
+        return Decimal(valor_str.replace('.', '').replace(',', '.')).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+
+    def extrair_valores_linha(linha):
+        return re.findall(r'(-?\d{1,3}(?:\.\d{3})*,\d{2})', linha)
+
+    texto = ""
+    with pdfplumber.open(pdf_path, password=pdf_password) as pdf:
+        for pagina in pdf.pages:
+            t = pagina.extract_text()
+            if t:
+                texto += t + "\n"
+
+    linhas = texto.splitlines()
+    registros = []
+    saldo_anterior = None
+
+    for linha in linhas:
+        if "Saldo Anterior" in linha:
+            valores = extrair_valores_linha(linha)
+            if valores:
+                saldo_anterior = br_to_decimal(valores[-1])
+            continue
+
+        if re.match(r"\d{2}/\d{2}/\d{4}", linha):
+            data = linha[:10]
+            valores = extrair_valores_linha(linha)
+            if not valores:
+                continue
+            valor_mov = br_to_decimal(valores[0])
+            saldo_info = br_to_decimal(valores[1]) if len(valores) > 1 else None
+            historico = linha[11:].strip()
+            if len(valores) > 1:
+                historico = re.sub(r'\s+' + re.escape(valores[-1]) + r'\s*$', '', historico).strip()
+            registros.append({
+                "Data": data,
+                "Historico": historico,
+                "Valor": valor_mov,
+                "Saldo_Informado": saldo_info
+            })
+
+    df = pd.DataFrame(registros).reset_index(drop=True)
+    if df.empty or saldo_anterior is None:
+        return pd.DataFrame(columns=["Data", "Descrição", "Documento", "Valor", "Tipo", "Débito", "Crédito"])
+
+    def resolver_bloco(bloco, saldo_ant, saldo_final):
+        bloco = bloco.copy()
+        bloco["Tipo"] = None
+        livres = []
+        for i, row in bloco.iterrows():
+            hist = row["Historico"].upper()
+            if "INTEGR PARC CAPITAL" in hist:
+                bloco.at[i, "Tipo"] = "D"
+            elif "RECEB" in hist:
+                bloco.at[i, "Tipo"] = "C"
+            else:
+                livres.append(i)
+
+        saldo_base = saldo_ant
+        for i, row in bloco.iterrows():
+            if row["Tipo"] == "C":
+                saldo_base += row["Valor"]
+            elif row["Tipo"] == "D":
+                saldo_base -= row["Valor"]
+
+        for combinacao in itertools.product(["C","D"], repeat=len(livres)):
+            saldo_teste = saldo_base
+            for idx, tipo in zip(livres, combinacao):
+                valor = bloco.at[idx, "Valor"]
+                saldo_teste = saldo_teste + valor if tipo == "C" else saldo_teste - valor
+            if abs(saldo_teste - saldo_final) <= TOL:
+                for idx, tipo in zip(livres, combinacao):
+                    bloco.at[idx, "Tipo"] = tipo
+                return bloco, True
+
+        return bloco, False
+
+    saldo_confirmado = saldo_anterior
+    inicio_bloco = 0
+    df["Tipo"] = None
+
+    for i in range(len(df)):
+        if pd.notna(df.loc[i, "Saldo_Informado"]):
+            saldo_final = df.loc[i, "Saldo_Informado"]
+            bloco = df.loc[inicio_bloco:i].copy()
+            bloco_resolvido, ok = resolver_bloco(bloco, saldo_confirmado, saldo_final)
+            if ok:
+                df.loc[inicio_bloco:i, "Tipo"] = bloco_resolvido["Tipo"]
+            saldo_confirmado = saldo_final
+            inicio_bloco = i + 1
+
+    out = pd.DataFrame({
+        "Data": df["Data"],
+        "Descrição": df["Historico"],
+        "Documento": "",
+        "Valor": [
+            float(v) if t == "C" else -float(v) if t == "D" else None
+            for v, t in zip(df["Valor"], df["Tipo"])
+        ]
+    })
+    out = out[out["Valor"].notna()]
+    return standardize(out)
+
+
+# ---------------- Dispatcher ----------------
+
+def parse_one_pdf(pdf_path):
+    lines, pdf_password = extract_lines(pdf_path)
+    if not lines:
+        return "", pd.DataFrame()
+
+    txt = " ".join(lines[:250]).lower()
+    name = os.path.basename(pdf_path).lower()
+
+    if "extrato exportado no dia" in txt and "data contábil" in txt and "saldo do dia" in txt:
+        return "c6", parse_c6(lines, pdf_path)
+
+    if "extrato histórico da conta" in txt and "data e hora" in txt and "data mov." in txt and ("nr.doc." in txt or "nr.doc" in txt):
+        return "caixa_layout2", parse_caixa_layout2(pdf_path, pdf_password=pdf_password)
+
+    if "sihex" in txt and ("sistema de histórico de extratos" in txt or "sistema de historico de extratos" in txt) and "data mov." in txt and "nr. doc." in txt:
+        return "caixa_layout1", parse_caixa_layout1(lines)
+
+    if ("consultas - extrato de conta corrente" in txt) or ("sisbb" in txt) or name.startswith("bb_layout"):
+        layout, df = parse_bb_auto(lines)
+        return layout, df
+
+    if "banco abc" in txt or name == "abc.pdf":
+        return "abc", parse_abc(lines)
+
+    if "banrisul" in txt or "b a n r i s u l" in txt or name.startswith("banrisul"):
+        return "banrisul", parse_banrisul(lines)
+
+    if "sicredi" in txt or "cooperativa:" in txt:
+        return "sicredi", parse_sicredi(lines, pdf_path=pdf_path, pdf_password=pdf_password)
+
+    if "santander" in txt or "contamax" in txt or name.startswith("santander"):
+        return "santander", parse_santander(pdf_path, lines, pdf_password=pdf_password)
+
+    if ("banco inter" in txt and "santander" not in txt) or "saldo por transação" in txt or name.startswith("inter"):
+        return "inter", parse_inter(lines)
+
+    if "itaú" in txt or "itau" in txt or "extrato mensal" in txt or is_itau_layout3_signature(txt) or is_itau_layout4_signature(txt) or name == "itau.pdf":
+        return "itau", parse_itau(lines)
+
+    if "unicred" in txt or "instituição financeira:  136" in txt.lower() or name == "unicred.pdf":
+        return "unicred", parse_unicred(pdf_path, pdf_password=pdf_password)
+
+    if re.search(r"\bef[ií]\b", txt) or "extrato financeiro" in txt or name == "efi_bank.pdf":
+        return "efi", parse_efi(lines)
+
+    layout, df = parse_bb_auto(lines)
+    if not df.empty:
+        return layout, df
+
+    return "desconhecido", pd.DataFrame(columns=["Data", "Descrição", "Documento", "Valor"])
+
+
+def parse_one_file(file_path):
+    ext = os.path.splitext(file_path)[1].lower()
+    if ext == ".ofx":
+        return "ofx", parse_ofx_file(file_path)
+    return parse_one_pdf(file_path)
+
+
+# ---------------- XLSX e fluxo ----------------
+
+def export_xlsx(out_path, df_all, df_logs):
+    engine = "xlsxwriter"
+    try:
+        __import__("xlsxwriter")
+    except Exception:
+        engine = "openpyxl"
+
+    with pd.ExcelWriter(out_path, engine=engine) as writer:
+        df_all.to_excel(writer, index=False, sheet_name="Consolidado")
+        df_logs.to_excel(writer, index=False, sheet_name="Logs")
+
+        if engine == "xlsxwriter":
+            wb = writer.book
+            ws = writer.sheets["Consolidado"]
+            ws_logs = writer.sheets["Logs"]
+
+            money_fmt = wb.add_format({"num_format": "R$ #,##0.00;[Red]-R$ #,##0.00"})
+            date_fmt = wb.add_format({"num_format": "dd/mm/yyyy"})
+
+            ws.set_column("A:A", 35)
+            ws.set_column("B:B", 12, date_fmt)
+            ws.set_column("C:C", 110)
+            ws.set_column("D:D", 22)
+            ws.set_column("E:E", 16, money_fmt)
+            ws.set_column("F:F", 6)
+            ws.set_column("G:H", 16, money_fmt)
+
+            ws_logs.set_column("A:A", 35)
+            ws_logs.set_column("B:B", 20)
+        else:
+            ws = writer.sheets["Consolidado"]
+            ws_logs = writer.sheets["Logs"]
+            widths = {"A": 35, "B": 12, "C": 110, "D": 22, "E": 16, "F": 6, "G": 16, "H": 16}
+            for col, width in widths.items():
+                ws.column_dimensions[col].width = width
+            ws_logs.column_dimensions["A"].width = 35
+            ws_logs.column_dimensions["B"].width = 20
+            for row in ws.iter_rows(min_row=2):
+                row[1].number_format = 'DD/MM/YYYY'
+                for idx in (4, 6, 7):
+                    row[idx].number_format = 'R$ #,##0.00;[Red]-R$ #,##0.00'
+
+
+def escolher_pasta():
+    try:
+        import tkinter as tk
+        from tkinter import filedialog
+        root = tk.Tk()
+        root.withdraw()
+        root.attributes("-topmost", True)
+        pasta = filedialog.askdirectory(title="Selecione a pasta com PDFs/OFX")
+        root.destroy()
+        return pasta or None
+    except Exception:
+        return None
+
+
+def processar_pasta(folder):
+    arquivos = list_input_files(folder)
+    if not arquivos:
+        raise FileNotFoundError(f"Não encontrei arquivos PDF/OFX em: {folder}")
+
+    dados = []
+    logs = []
+    total = len(arquivos)
+
+    for idx, file_path in enumerate(arquivos, start=1):
+        nome = os.path.basename(file_path)
+        try:
+            layout, df = parse_one_file(file_path)
+            if df.empty:
+                logs.append([nome, "erro"])
+                print(f"[{idx}/{total}] ERRO - {nome} | sem transações extraídas")
+                continue
+
+            df.insert(0, "Arquivo", nome)
+            dados.append(df)
+            logs.append([nome, int(len(df))])
+            print(f"[{idx}/{total}] OK   - {nome} | {layout} | {len(df)} transação(ões)")
+
+        except Exception as e:
+            logs.append([nome, "erro"])
+            print(f"[{idx}/{total}] ERRO - {nome} | {e}")
+
+    if dados:
+        df_all = pd.concat(dados, ignore_index=True)
+        df_all = df_all[["Arquivo", "Data", "Descrição", "Documento", "Valor", "Tipo", "Débito", "Crédito"]]
+    else:
+        df_all = pd.DataFrame(columns=["Arquivo", "Data", "Descrição", "Documento", "Valor", "Tipo", "Débito", "Crédito"])
+
+    df_logs = pd.DataFrame(logs, columns=["Arquivo", "n_transações_obtidas"])
+
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = os.path.join(folder, f"consolidado_lancamentos_{stamp}.xlsx")
+    export_xlsx(out_path, df_all, df_logs)
+    return df_all, df_logs, out_path
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--pasta", help="Pasta com PDFs (se omitido, abre seletor)")
+    args = parser.parse_args()
+
+    folder = args.pasta or escolher_pasta()
+    if not folder:
+        print("Nenhuma pasta selecionada.")
+        return
+
+    try:
+        df_all, df_logs, out_path = processar_pasta(folder)
+        print("\nArquivo gerado:")
+        print(out_path)
+        print(f"Total de transações: {len(df_all)}")
+        print(f"Arquivos com erro: {(df_logs['n_transações_obtidas'] == 'erro').sum()}")
+    except Exception as e:
+        print("\nERRO GERAL:")
+        print(str(e))
+
+
+if __name__ == "__main__":
+    main()
